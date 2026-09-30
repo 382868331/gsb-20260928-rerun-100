@@ -49,7 +49,13 @@ type Manager struct {
 	instances map[string]*Instance
 	providers map[string]string // capability -> extension name
 	taskSeq   int
+	switchSeq int
 	closed    bool
+	stopCh    chan struct{}     // closed when host shutdown begins
+	retired   []*Instance       // old incarnations draining in flight
+
+	upgradeMu sync.Mutex // serialises overlapping upgrade attempts
+	upgrading sync.WaitGroup
 }
 
 // New validates manifests and resolves the dependency order. Any
@@ -62,29 +68,39 @@ func New(manifests []Manifest, cfg Config) (*Manager, error) {
 		instances: map[string]*Instance{},
 		providers: map[string]string{},
 	}
+	order, err := validateManifests(manifests, m.manifests)
+	if err != nil {
+		return nil, err
+	}
+	m.order = order
+	return m, nil
+}
+
+// validateManifests checks the candidate set for basic problems,
+// duplicate capability providers and dependency cycles, then returns
+// the dependency-resolved start order. existing is used when verifying
+// candidate sets during an upgrade (its contents are overwritten).
+func validateManifests(manifests []Manifest, existing map[string]Manifest) ([]string, error) {
 	for _, mf := range manifests {
 		if mf.Name == "" || mf.Path == "" {
 			return nil, fmt.Errorf("manifest with empty name or path")
 		}
-		if _, dup := m.manifests[mf.Name]; dup {
+		if _, dup := existing[mf.Name]; dup {
 			return nil, fmt.Errorf("duplicate extension %q", mf.Name)
 		}
-		m.manifests[mf.Name] = mf
+		existing[mf.Name] = mf
 	}
-	if err := m.resolveOrder(); err != nil {
-		return nil, err
-	}
-	return m, nil
+	return resolveOrder(existing)
 }
 
 // resolveOrder topologically sorts extensions so providers start before
 // the extensions that require their capabilities.
-func (m *Manager) resolveOrder() error {
+func resolveOrder(manifests map[string]Manifest) ([]string, error) {
 	provider := map[string]string{} // capability -> owning extension
-	for name, mf := range m.manifests {
+	for name, mf := range manifests {
 		for _, c := range mf.Provides {
 			if other, ok := provider[c]; ok {
-				return fmt.Errorf("capability %q provided by both %q and %q", c, other, name)
+				return nil, fmt.Errorf("capability %q provided by both %q and %q", c, other, name)
 			}
 			provider[c] = name
 		}
@@ -93,6 +109,10 @@ func (m *Manager) resolveOrder() error {
 	state := map[string]int{} // 0 unseen, 1 on-stack, 2 done
 	var visit func(name string) error
 	visit = func(name string) error {
+		mf, ok := manifests[name]
+		if !ok {
+			return fmt.Errorf("unknown extension %q", name)
+		}
 		switch state[name] {
 		case 1:
 			return fmt.Errorf("dependency cycle through extension %q", name)
@@ -100,7 +120,6 @@ func (m *Manager) resolveOrder() error {
 			return nil
 		}
 		state[name] = 1
-		mf := m.manifests[name]
 		for _, req := range mf.Requires {
 			other, ok := provider[req]
 			if !ok {
@@ -118,8 +137,8 @@ func (m *Manager) resolveOrder() error {
 		return nil
 	}
 	// Deterministic traversal: visit manifests in name order.
-	names := make([]string, 0, len(m.manifests))
-	for name := range m.manifests {
+	names := make([]string, 0, len(manifests))
+	for name := range manifests {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -128,8 +147,18 @@ func (m *Manager) resolveOrder() error {
 			return err
 		}
 	}
-	m.order = order
-	return nil
+	return order, nil
+}
+
+// stop is closed during Shutdown so long-running upgrade preparations
+// end with an explicit reason instead of blocking forever.
+func (m *Manager) stop() <-chan struct{} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopCh == nil {
+		m.stopCh = make(chan struct{})
+	}
+	return m.stopCh
 }
 
 // Start launches extensions in dependency order and verifies the
@@ -145,42 +174,46 @@ func (m *Manager) Start() error {
 			m.rollback(started)
 			return fmt.Errorf("start %s: %w", name, err)
 		}
-		if inst.name != name {
+		if err := m.verifyInstance(mf, inst, m.providers); err != nil {
 			inst.shutdown(0)
 			m.rollback(started)
-			return fmt.Errorf("start %s: binary identified itself as %q", name, inst.name)
-		}
-		// Capability compatibility check before becoming ready:
-		// every declared requirement must be live, and every
-		// advertised capability must be in the manifest.
-		declared := map[string]bool{}
-		for _, c := range mf.Provides {
-			declared[c] = true
-			if _, ok := inst.caps[c]; !ok {
-				inst.shutdown(0)
-				m.rollback(started)
-				return fmt.Errorf("extension %s is incompatible: missing capability %q", name, c)
-			}
-		}
-		for c := range inst.caps {
-			if !declared[c] {
-				inst.shutdown(0)
-				m.rollback(started)
-				return fmt.Errorf("extension %s is incompatible: undeclared capability %q", name, c)
-			}
-		}
-		for _, req := range mf.Requires {
-			if _, ok := m.providers[req]; !ok {
-				inst.shutdown(0)
-				m.rollback(started)
-				return fmt.Errorf("extension %s requires capability %q which is not live", name, req)
-			}
+			return err
 		}
 		m.instances[name] = inst
 		for _, c := range mf.Provides {
 			m.providers[c] = name
 		}
 		started = append(started, name)
+	}
+	return nil
+}
+
+// verifyInstance checks a freshly spawned candidate before it is
+// allowed to receive a single task: identity, exact capability set,
+// and that every required capability is provided by some (already
+// ordered) extension. live maps capability -> provider within the set
+// being prepared; nil falls back to the running provider table.
+func (m *Manager) verifyInstance(mf Manifest, inst *Instance, providers map[string]string) error {
+	name := mf.Name
+	if inst.name != name {
+		return fmt.Errorf("start %s: binary identified itself as %q", name, inst.name)
+	}
+	declared := map[string]bool{}
+	for _, c := range mf.Provides {
+		declared[c] = true
+		if _, ok := inst.caps[c]; !ok {
+			return fmt.Errorf("extension %s is incompatible: missing capability %q", name, c)
+		}
+	}
+	for c := range inst.caps {
+		if !declared[c] {
+			return fmt.Errorf("extension %s is incompatible: undeclared capability %q", name, c)
+		}
+	}
+	for _, req := range mf.Requires {
+		if _, ok := providers[req]; !ok {
+			return fmt.Errorf("extension %s requires capability %q which is not live", name, req)
+		}
 	}
 	return nil
 }
@@ -285,6 +318,256 @@ func (m *Manager) Restart(name string) error {
 		m.providers[c] = name
 	}
 	return nil
+}
+
+// stagedItem is one extension in an in-progress upgrade.
+type stagedItem struct {
+	name string
+	new  *Instance // nil until spawned
+	old  *Instance // nil when there was no running incarnation
+}
+
+// Upgrade atomically replaces one or more extension builds. Candidates
+// are spawned and fully validated (protocol handshake, identity,
+// capability set, dependencies against the candidate provider table)
+// before any traffic is cut over, so a failing candidate keeps the old
+// version serving untouched. Only after cutover does each old process
+// stop receiving new tasks and drain the work it already accepted.
+// Every phase is appended to the switch audit trail.
+//
+// This makes the combination "dependency also upgrading + old process
+// exits + new version fails to start" safe: a failure anywhere before
+// cutover tears down only the candidates, while the running versions
+// (including any that crashed independently) remain the task owners.
+func (m *Manager) Upgrade(candidates []Manifest) error {
+	m.upgradeMu.Lock()
+	m.upgrading.Add(1)
+	defer m.upgrading.Done()
+	defer m.upgradeMu.Unlock()
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return fmt.Errorf("manager is shutting down")
+	}
+	m.switchSeq++
+	upgradeID := fmt.Sprintf("upgrade-%d", m.switchSeq)
+	stop := m.stopLocked()
+	oldOrder := append([]string{}, m.order...)
+	m.mu.Unlock()
+
+	// Build the post-upgrade manifest set: candidates replace existing
+	// manifests with the same name; other extensions are kept.
+	next := map[string]Manifest{}
+	for name, mf := range m.manifests {
+		next[name] = mf
+	}
+	for _, mf := range candidates {
+		if _, known := next[mf.Name]; !known {
+			return fmt.Errorf("upgrade unknown extension %q", mf.Name)
+		}
+		next[mf.Name] = mf
+	}
+	order, err := resolveOrder(next)
+	if err != nil {
+		for _, mf := range candidates {
+			m.recordSwitch(SwitchAbort, upgradeID, mf.Name, nil, nil, err.Error())
+		}
+		return err
+	}
+
+	// Snapshot current instances/providers for dependency checks and
+	// for restoring ownership if the upgrade must be abandoned.
+	m.mu.Lock()
+	liveProviders := map[string]string{}
+	for c, p := range m.providers {
+		liveProviders[c] = p
+	}
+	items := make([]stagedItem, 0, len(candidates))
+	byName := map[string]*stagedItem{}
+	for _, mf := range candidates {
+		item := &stagedItem{name: mf.Name, old: m.instances[mf.Name]}
+		items = append(items, *item)
+	}
+	// Rebuild pointers into a stable backing slice.
+	staged := make([]stagedItem, len(items))
+	for i := range items {
+		staged[i] = items[i]
+		byName[items[i].name] = &staged[i]
+	}
+	m.mu.Unlock()
+
+	m.recordSwitch(SwitchValidate, upgradeID, "", nil, nil, "candidate set passed topology checks")
+
+	// Spawn candidates in dependency order. The candidate provider
+	// table starts from live providers, then overlays each candidate as
+	// it is prepared, so a candidate requiring an upgraded dependency
+	// is validated against the new build, not the old one.
+	candidateProviders := map[string]string{}
+	for c, p := range liveProviders {
+		candidateProviders[c] = p
+	}
+	for _, mf := range candidates {
+		for _, c := range mf.Provides {
+			candidateProviders[c] = mf.Name
+		}
+	}
+
+	prepared := map[string]*Instance{}
+	for _, name := range order {
+		item := byName[name]
+		if item == nil {
+			continue
+		}
+		mf := next[name]
+		inst, spawnErr := m.spawnCandidate(mf, stop)
+		if spawnErr != nil {
+			m.abortUpgrade(upgradeID, staged, prepared, spawnErr, stop)
+			return spawnErr
+		}
+		if err := m.verifyInstance(mf, inst, candidateProviders); err != nil {
+			inst.shutdown(0)
+			m.abortUpgrade(upgradeID, staged, prepared, err, stop)
+			return err
+		}
+		item.new = inst
+		prepared[name] = inst
+		old := item.old
+		m.recordSwitch(SwitchPrepared, upgradeID, name, old, inst, "handshake and capability checks passed")
+	}
+
+	// All candidates are valid. Cut over atomically: new tasks now go
+	// only to the new instances. Calls already in flight keep holding
+	// the old Instance pointer, so a task is never delivered twice.
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		closeErr := fmt.Errorf("host closed before cutover")
+		m.abortUpgrade(upgradeID, staged, prepared, closeErr, stop)
+		return closeErr
+	}
+	for i := range staged {
+		item := &staged[i]
+		if item.old != nil {
+			m.retired = append(m.retired, item.old)
+		}
+		m.instances[item.name] = item.new
+		m.manifests[item.name] = next[item.name]
+		m.recordSwitchLocked(SwitchCutover, upgradeID, item.name, item.old, item.new, "new tasks route to new version")
+	}
+	m.order = order
+	m.mu.Unlock()
+
+	// Drain old incarnations in reverse dependency order so providers
+	// outlive their dependents during the handoff. The drain ends for
+	// an explicit reason: clean bye/exit, the agreed grace boundary, or
+	// host shutdown.
+	for i := len(order) - 1; i >= 0; i-- {
+		item := byName[order[i]]
+		if item == nil || item.old == nil {
+			continue
+		}
+		old := item.old
+		reason := old.drain(m.cfg.ShutdownGrace, stop)
+		switchDetail := string(reason)
+		event := SwitchDrained
+		switch {
+		case reason == EndGraceKill:
+			event = SwitchDrainKilled
+			switchDetail = "drain boundary exceeded; old process killed"
+		case reason == EndHostClose:
+			event = SwitchHostClose
+			switchDetail = "host closed; old process killed"
+		}
+		m.recordSwitch(event, upgradeID, item.name, old, item.new, switchDetail)
+		m.mu.Lock()
+		m.retired = removeInstance(m.retired, old)
+		m.mu.Unlock()
+	}
+	for i := len(staged) - 1; i >= 0; i-- {
+		item := &staged[i]
+		m.recordSwitch(SwitchActivated, upgradeID, item.name, item.old, item.new, "handoff complete")
+	}
+	return nil
+}
+
+// spawnCandidate spawns one candidate but aborts promptly with an
+// explicit reason if host shutdown starts during the handshake.
+func (m *Manager) spawnCandidate(mf Manifest, stop <-chan struct{}) (*Instance, error) {
+	type result struct {
+		inst *Instance
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		inst, err := spawn(mf, m.cfg.HandshakeTimeout)
+		ch <- result{inst, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.inst, r.err
+	case <-stop:
+		go func() {
+			r := <-ch
+			if r.inst != nil {
+				r.inst.killNow()
+			}
+		}()
+		return nil, fmt.Errorf("host closed while starting %s", mf.Name)
+	}
+}
+
+// abortUpgrade tears down every prepared candidate in reverse order
+// and records that the old version was retained. It never touches the
+// running instances, so task ownership stays with the old build.
+func (m *Manager) abortUpgrade(upgradeID string, staged []stagedItem, prepared map[string]*Instance, cause error, stop <-chan struct{}) {
+	for i := len(staged) - 1; i >= 0; i-- {
+		item := &staged[i]
+		new := item.new
+		if new == nil {
+			m.recordSwitch(SwitchAbort, upgradeID, item.name, item.old, nil, cause.Error())
+			continue
+		}
+		reason := new.drain(m.cfg.ShutdownGrace, stop)
+		m.recordSwitch(SwitchRollback, upgradeID, item.name, item.old, new,
+			fmt.Sprintf("candidate rejected (%v); removed (%s); old version retained", cause, reason))
+	}
+}
+
+func removeInstance(list []*Instance, target *Instance) []*Instance {
+	out := list[:0]
+	for _, inst := range list {
+		if inst != target {
+			out = append(out, inst)
+		}
+	}
+	return out
+}
+
+func (m *Manager) recordSwitch(event, upgradeID, name string, old, new *Instance, detail string) {
+	if m.cfg.Journal == nil {
+		return
+	}
+	rec := SwitchRecord{Event: event, UpgradeID: upgradeID, Extension: name, Detail: detail}
+	if old != nil {
+		rec.OldVersion, rec.OldSession = old.extVer, old.session
+	}
+	if new != nil {
+		rec.NewVersion, rec.NewSession = new.extVer, new.session
+	}
+	m.cfg.Journal.Switch(rec)
+}
+
+func (m *Manager) recordSwitchLocked(event, upgradeID, name string, old, new *Instance, detail string) {
+	m.recordSwitch(event, upgradeID, name, old, new, detail)
+}
+
+// stopLocked returns the shutdown signal channel, creating it.
+func (m *Manager) stopLocked() <-chan struct{} {
+	if m.stopCh == nil {
+		m.stopCh = make(chan struct{})
+	}
+	return m.stopCh
 }
 
 // Session returns the current session token of an extension.

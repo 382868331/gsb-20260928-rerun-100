@@ -37,7 +37,19 @@ type Instance struct {
 	mu      sync.Mutex
 	pending map[string]*pendingCall
 	alive   bool
+
+	bye chan struct{} // closed when the extension sends bye
 }
+
+// EndReason explains why a wait on an instance finished.
+type EndReason string
+
+const (
+	EndExited     EndReason = "exited"      // process exited of its own accord
+	EndBye        EndReason = "bye"         // drained and sent bye
+	EndGraceKill  EndReason = "grace_kill"  // exceeded grace/drain boundary
+	EndHostClose  EndReason = "host_close"  // host shutdown interrupted the wait
+)
 
 func newSessionToken() string {
 	b := make([]byte, 16)
@@ -73,6 +85,7 @@ func spawn(mf Manifest, handshakeTimeout time.Duration) (*Instance, error) {
 		done:    make(chan struct{}),
 		pending: map[string]*pendingCall{},
 		alive:   true,
+		bye:     make(chan struct{}),
 	}
 
 	hello := &protocol.Message{
@@ -147,6 +160,14 @@ func (inst *Instance) serve(stdout io.Reader) {
 		if msg.Session != inst.session {
 			continue
 		}
+		if msg.Type == protocol.TypeBye {
+			select {
+			case <-inst.bye:
+			default:
+				close(inst.bye)
+			}
+			continue
+		}
 		inst.mu.Lock()
 		pc, ok := inst.pending[msg.ID]
 		if ok {
@@ -205,23 +226,111 @@ func (inst *Instance) call(id, capability string, payload json.RawMessage, timeo
 	}
 }
 
+// inFlight reports how many tasks have been dispatched but not answered.
+func (inst *Instance) inFlight() int {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	return len(inst.pending)
+}
+
+// waitExit blocks until the process exits, the deadline elapses, or
+// stop closes. It always returns an explicit reason for why the wait
+// ended; deadline<=0 means "no drain boundary". When killed, pending
+// callers are failed by the cmd.Wait goroutine.
+func (inst *Instance) waitExit(deadline <-chan time.Time, stop <-chan struct{}) EndReason {
+	select {
+	case <-inst.done:
+		return EndExited
+	default:
+	}
+	select {
+	case <-inst.done:
+		return EndExited
+	case <-inst.bye:
+		select {
+		case <-inst.done:
+			return EndBye
+		case <-deadlineOrNil(deadline):
+			_ = inst.cmd.Process.Kill()
+			<-inst.done
+			return EndGraceKill
+		case <-stopOrNil(stop):
+			_ = inst.cmd.Process.Kill()
+			<-inst.done
+			return EndHostClose
+		}
+	case <-deadlineOrNil(deadline):
+		_ = inst.cmd.Process.Kill()
+		<-inst.done
+		return EndGraceKill
+	case <-stopOrNil(stop):
+		_ = inst.cmd.Process.Kill()
+		<-inst.done
+		return EndHostClose
+	}
+}
+
+func deadlineOrNil(c <-chan time.Time) <-chan time.Time {
+	if c == nil {
+		return nil
+	}
+	return c
+}
+
+func stopOrNil(c <-chan struct{}) <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	return c
+}
+
+// signalShutdown sends the shutdown directive when the instance is
+// still alive.
+func (inst *Instance) signalShutdown() bool {
+	inst.mu.Lock()
+	alive := inst.alive
+	inst.mu.Unlock()
+	if !alive {
+		return false
+	}
+	_ = protocol.Encode(inst.stdin, &protocol.Message{
+		Type:    protocol.TypeShutdown,
+		Session: inst.session,
+	})
+	return true
+}
+
+// drain asks the old instance to stop accepting new work, then waits
+// for in-flight tasks to finish and the process to exit. The grace
+// duration is the agreed drain boundary; beyond it the process is
+// killed. stop interrupts the wait with an explicit host-close reason.
+func (inst *Instance) drain(grace time.Duration, stop <-chan struct{}) EndReason {
+	if !inst.signalShutdown() {
+		return EndExited
+	}
+	var deadline <-chan time.Time
+	if grace > 0 {
+		t := time.NewTimer(grace)
+		defer t.Stop()
+		deadline = t.C
+	}
+	return inst.waitExit(deadline, stop)
+}
+
 // shutdown asks the extension to stop accepting work and exit, then
 // escalates to SIGKILL after the grace period.
 func (inst *Instance) shutdown(grace time.Duration) {
+	inst.drain(grace, nil)
+}
+
+// killNow terminates the process immediately and waits for cleanup.
+func (inst *Instance) killNow() {
 	inst.mu.Lock()
 	alive := inst.alive
 	inst.mu.Unlock()
 	if !alive {
 		return
 	}
-	_ = protocol.Encode(inst.stdin, &protocol.Message{
-		Type:    protocol.TypeShutdown,
-		Session: inst.session,
-	})
-	select {
-	case <-inst.done:
-	case <-time.After(grace):
-		_ = inst.cmd.Process.Kill()
-		<-inst.done
-	}
+	_ = inst.cmd.Process.Kill()
+	<-inst.done
 }
