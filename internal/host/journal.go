@@ -20,6 +20,22 @@ type JournalEntry struct {
 	Detail     string    `json:"detail,omitempty"`
 }
 
+// SwitchEntry records one extension-generation handover so every
+// ownership transfer is auditable: which build and session handed off,
+// which took over, and how the old process ended.
+type SwitchEntry struct {
+	Time       time.Time `json:"time"`
+	Extension  string    `json:"extension"`
+	Action     string    `json:"action"` // upgraded | upgrade_failed | startup | shutdown
+	OldVersion string    `json:"old_version,omitempty"`
+	OldSession string    `json:"old_session,omitempty"`
+	NewVersion string    `json:"new_version,omitempty"`
+	NewSession string    `json:"new_session,omitempty"`
+	Result     string    `json:"result"` // committed | retained_old | rolled_back
+	Drain      string    `json:"drain_reason,omitempty"`
+	Detail     string    `json:"detail,omitempty"`
+}
+
 // Journal appends task records to a JSON-lines file.
 type Journal struct {
 	mu  sync.Mutex
@@ -36,6 +52,14 @@ func OpenJournal(path string) (*Journal, error) {
 }
 
 func (j *Journal) Record(e JournalEntry) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	e.Time = time.Now().UTC()
+	_ = j.enc.Encode(&e)
+}
+
+// RecordSwitch appends one handover audit record.
+func (j *Journal) RecordSwitch(e SwitchEntry) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	e.Time = time.Now().UTC()

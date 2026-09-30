@@ -84,14 +84,24 @@ func main() {
 		mustJSON(mgr.Call("sha256", map[string]string{"text": "after-crash"})))
 
 	// --- Restart with a fresh session -----------------------------
-	oldSession := mgr.Session("textkit")
-	if err := mgr.Restart("textkit"); err != nil {
-		log.Fatalf("restart textkit: %v", err)
+	// Simulate a new build of textkit: the host first starts and
+	// verifies the new generation, then atomically moves task ownership
+	// to it and lets the old generation drain its accepted tasks.
+	upgrade := host.Manifest{
+		Name:     "textkit",
+		Path:     filepath.Join(binDir, "textkit"),
+		Provides: []string{"uppercase", "wordcount", "sleep", "panic"},
+		Requires: []string{"sha256"},
 	}
-	newSession := mgr.Session("textkit")
-	fmt.Printf("[host] textkit restarted: old session %s... retired, new session %s...\n",
-		oldSession[:8], newSession[:8])
-	fmt.Println("[task] uppercase after restart ->",
+	switches, err := mgr.UpgradeSet([]host.Manifest{upgrade})
+	if err != nil {
+		log.Fatalf("upgrade textkit: %v", err)
+	}
+	for _, s := range switches {
+		fmt.Printf("[host] %s handover %q: session %s... -> %s..., old process end reason: %s\n",
+			s.Name, s.NewVersion, s.OldSession[:8], s.NewSession[:8], s.DrainReason)
+	}
+	fmt.Println("[task] uppercase after handover ->",
 		mustJSON(mgr.Call("uppercase", map[string]string{"text": "back online"})))
 
 	// --- Timeout supervision --------------------------------------
@@ -102,5 +112,8 @@ func main() {
 	// --- Graceful shutdown ----------------------------------------
 	fmt.Println("[host] shutting down: stop accepting, drain, exit")
 	mgr.Shutdown()
-	fmt.Println("[host] all extensions exited cleanly; task journal at state/tasks.jsonl")
+	for name, reason := range mgr.ShutdownReasons() {
+		fmt.Printf("[host] %s terminated: %s\n", name, reason)
+	}
+	fmt.Println("[host] every wait resolved with an explicit reason; task journal at state/tasks.jsonl")
 }

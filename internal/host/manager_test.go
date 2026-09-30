@@ -16,13 +16,17 @@ import (
 // in EXTSYS_TEST_CAPS so manifest enforcement can be exercised.
 func helperExt() {
 	name := os.Getenv("EXTSYS_TEST_NAME")
+	version := os.Getenv("EXTSYS_TEST_VERSION")
+	if version == "" {
+		version = "3.1.4-test"
+	}
 	caps := map[string]bool{}
 	for _, c := range strings.Split(os.Getenv("EXTSYS_TEST_CAPS"), ",") {
 		if c != "" {
 			caps[c] = true
 		}
 	}
-	ext := extsdk.New(name, "3.1.4-test")
+	ext := extsdk.New(name, version)
 	if caps["echo"] {
 		ext.Handle("echo", 1, func(p json.RawMessage) (any, error) {
 			return map[string]json.RawMessage{"echoed": p}, nil
@@ -62,15 +66,30 @@ func TestMain(m *testing.M) {
 }
 
 func helperManifest(name string, provides []string, requires []string) Manifest {
-	all := append(append([]string{}, provides...), requires...)
 	return Manifest{
 		Name:     name,
 		Path:     os.Args[0],
 		Args:     []string{"-test.run=^TestMain$"},
-		Env:      []string{"EXTSYS_TEST_HELPER=1", "EXTSYS_TEST_NAME=" + name, "EXTSYS_TEST_CAPS=" + strings.Join(all, ",")},
+		Env:      helperEnv(name, strings.Join(provides, ","), "3.1.4-test"),
 		Provides: provides,
 		Requires: requires,
 	}
+}
+
+func helperManifestVersion(name, version string, provides []string, requires []string) Manifest {
+	mf := helperManifest(name, provides, requires)
+	mf.Env = helperEnv(name, strings.Join(provides, ","), version)
+	return mf
+}
+
+func helperEnv(name, caps, version string) []string {
+	env := []string{
+		"EXTSYS_TEST_HELPER=1",
+		"EXTSYS_TEST_NAME=" + name,
+		"EXTSYS_TEST_CAPS=" + caps,
+		"EXTSYS_TEST_VERSION=" + version,
+	}
+	return env
 }
 
 func testManager(t *testing.T, manifests []Manifest, cfg Config) *Manager {
@@ -214,5 +233,201 @@ func TestCallsRejectedAfterShutdownBegins(t *testing.T) {
 	mgr.Shutdown()
 	if _, err := mgr.Call("echo", nil); err == nil {
 		t.Fatal("expected calls to be rejected after shutdown")
+	}
+}
+
+func TestUpgradeHandoverRotatesOwnershipAndSession(t *testing.T) {
+	cfg := Config{TaskTimeout: 2 * time.Second, ShutdownGrace: 2 * time.Second}
+	mgr := testManager(t, []Manifest{
+		helperManifestVersion("a", "1.0.0", []string{"echo"}, nil),
+	}, cfg)
+
+	oldSession := mgr.Session("a")
+	res, err := mgr.UpgradeSet([]Manifest{
+		helperManifestVersion("a", "2.0.0", []string{"echo"}, nil),
+	})
+	if err != nil {
+		t.Fatalf("UpgradeSet: %v", err)
+	}
+	if len(res) != 1 || res[0].OldSession != oldSession {
+		t.Fatalf("bad switch result: %+v", res)
+	}
+	if res[0].DrainReason != "drained" {
+		t.Fatalf("old generation should drain cleanly, got %q", res[0].DrainReason)
+	}
+	if res[0].NewSession == oldSession || res[0].NewVersion != "2.0.0" {
+		t.Fatalf("new generation identity wrong: %+v", res[0])
+	}
+	newSession := mgr.Session("a")
+	if newSession != res[0].NewSession {
+		t.Fatal("new tasks must route to the new session")
+	}
+
+	// The journal entry for the next task must name the new generation.
+	raw, err := mgr.Call("echo", map[string]string{"v": "new"})
+	if err != nil {
+		t.Fatalf("call after upgrade: %v", err)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpgradeOldProcessFinishesAcceptedTask(t *testing.T) {
+	cfg := Config{TaskTimeout: 5 * time.Second, ShutdownGrace: 5 * time.Second}
+	mgr := testManager(t, []Manifest{
+		helperManifestVersion("a", "1.0.0", []string{"sleep"}, nil),
+	}, cfg)
+	oldSession := mgr.Session("a")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := mgr.Call("sleep", map[string]int{"millis": 600})
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	res, err := mgr.UpgradeSet([]Manifest{
+		helperManifestVersion("a", "2.0.0", []string{"sleep"}, nil),
+	})
+	if err != nil {
+		t.Fatalf("UpgradeSet: %v", err)
+	}
+	if res[0].DrainReason != "drained" {
+		t.Fatalf("old process should finish its accepted task then bye: %s", res[0].DrainReason)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("task accepted by old generation must complete, got %v", err)
+	}
+	if s := mgr.Session("a"); s == oldSession {
+		t.Fatal("ownership must move to the new session")
+	}
+	// After the old process has exited, no stale-session reply exists:
+	// the new generation serves the next task exclusively.
+	if _, err := mgr.Call("sleep", map[string]int{"millis": 0}); err != nil {
+		t.Fatalf("new generation call: %v", err)
+	}
+}
+
+func TestUpgradeDependencySetValidatedTogether(t *testing.T) {
+	cfg := Config{TaskTimeout: 2 * time.Second, ShutdownGrace: 2 * time.Second}
+	mgr := testManager(t, []Manifest{
+		helperManifestVersion("dep", "1.0.0", []string{"echo"}, nil),
+		helperManifestVersion("app", "1.0.0", []string{"sleep"}, []string{"echo"}),
+	}, cfg)
+
+	// Both the dependency and the dependent upgrade in one atomic set.
+	_, err := mgr.UpgradeSet([]Manifest{
+		helperManifestVersion("dep", "2.0.0", []string{"echo"}, nil),
+		helperManifestVersion("app", "2.0.0", []string{"sleep"}, []string{"echo"}),
+	})
+	if err != nil {
+		t.Fatalf("combined upgrade: %v", err)
+	}
+	if mgr.Session("dep") == "" || mgr.Session("app") == "" {
+		t.Fatal("both new generations must be live")
+	}
+}
+
+func TestUpgradeFailureRetainsOldGenerations(t *testing.T) {
+	cfg := Config{TaskTimeout: 2 * time.Second, ShutdownGrace: 2 * time.Second}
+	mgr := testManager(t, []Manifest{
+		helperManifestVersion("a", "1.0.0", []string{"echo"}, nil),
+		helperManifestVersion("b", "1.0.0", []string{"sleep"}, nil),
+	}, cfg)
+	oldA := mgr.Session("a")
+	oldB := mgr.Session("b")
+
+	// a upgrades fine, but b's new build advertises fewer capabilities
+	// than its manifest requires: the whole set must abort and both old
+	// generations must remain task owners.
+	badB := helperManifestVersion("b", "2.0.0", []string{"sleep", "panic"}, nil)
+	badB.Provides = []string{"sleep", "panic"}
+	badB.Env = helperEnv("b", "sleep", "2.0.0") // panic not really served
+
+	_, err := mgr.UpgradeSet([]Manifest{
+		helperManifestVersion("a", "2.0.0", []string{"echo"}, nil),
+		badB,
+	})
+	if err == nil {
+		t.Fatal("expected combined upgrade to fail capability verification")
+	}
+	if mgr.Session("a") != oldA || mgr.Session("b") != oldB {
+		t.Fatal("old sessions must be retained after failed upgrade")
+	}
+	if _, err := mgr.Call("echo", nil); err != nil {
+		t.Fatalf("old a must still serve: %v", err)
+	}
+	if _, err := mgr.Call("sleep", map[string]int{"millis": 0}); err != nil {
+		t.Fatalf("old b must still serve: %v", err)
+	}
+}
+
+func TestUpgradeNewProcessStartFailureRetainsOld(t *testing.T) {
+	cfg := Config{TaskTimeout: 2 * time.Second, ShutdownGrace: 2 * time.Second}
+	mgr := testManager(t, []Manifest{
+		helperManifestVersion("a", "1.0.0", []string{"echo"}, nil),
+	}, cfg)
+	old := mgr.Session("a")
+
+	bad := helperManifestVersion("a", "2.0.0", []string{"echo"}, nil)
+	bad.Path = "/nonexistent/extsys-binary"
+	if _, err := mgr.UpgradeSet([]Manifest{bad}); err == nil {
+		t.Fatal("expected spawn failure")
+	}
+	if mgr.Session("a") != old {
+		t.Fatal("old generation must survive a failed new spawn")
+	}
+	if _, err := mgr.Call("echo", nil); err != nil {
+		t.Fatalf("old generation must still serve: %v", err)
+	}
+}
+
+func TestShutdownRecordsExplicitDrainReasons(t *testing.T) {
+	cfg := Config{TaskTimeout: 2 * time.Second, ShutdownGrace: 2 * time.Second}
+	mgr := testManager(t, []Manifest{
+		helperManifestVersion("a", "1.0.0", []string{"echo"}, nil),
+		helperManifestVersion("b", "1.0.0", []string{"sleep"}, nil),
+	}, cfg)
+
+	mgr.Shutdown()
+	reasons := mgr.ShutdownReasons()
+	if reasons["a"] != "drained" || reasons["b"] != "drained" {
+		t.Fatalf("every shutdown wait needs an explicit reason: %v", reasons)
+	}
+
+	// Calls after shutdown are rejected with a clear host-shutdown cause.
+	if _, err := mgr.Call("echo", nil); err == nil {
+		t.Fatal("expected rejection after shutdown")
+	}
+}
+
+func TestShutdownGraceKillHasExplicitReason(t *testing.T) {
+	cfg := Config{TaskTimeout: 2 * time.Second, ShutdownGrace: 150 * time.Millisecond}
+	mgr := testManager(t, []Manifest{
+		helperManifestVersion("a", "1.0.0", []string{"sleep"}, nil),
+	}, cfg)
+
+	// Occupy the extension with a long task; shutdown cannot drain within
+	// the grace period, so it must kill and report grace_killed.
+	blocked := make(chan error, 1)
+	go func() {
+		_, err := mgr.Call("sleep", map[string]int{"millis": 5000})
+		blocked <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	mgr.Shutdown()
+	reasons := mgr.ShutdownReasons()
+	if reasons["a"] != "grace_killed" {
+		t.Fatalf("want grace_killed, got %q", reasons["a"])
+	}
+	select {
+	case err := <-blocked:
+		if err == nil {
+			t.Fatal("pending waiter must wake with a termination error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending waiter must not hang after host shutdown")
 	}
 }

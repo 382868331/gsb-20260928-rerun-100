@@ -45,11 +45,13 @@ type Manager struct {
 	manifests map[string]Manifest
 	order     []string // dependency-resolved start order
 
-	mu        sync.Mutex
+	mu        sync.Mutex // held for the duration of a handover
 	instances map[string]*Instance
 	providers map[string]string // capability -> extension name
 	taskSeq   int
 	closed    bool
+
+	shutdownReasons map[string]string
 }
 
 // New validates manifests and resolves the dependency order. Any
@@ -71,65 +73,12 @@ func New(manifests []Manifest, cfg Config) (*Manager, error) {
 		}
 		m.manifests[mf.Name] = mf
 	}
-	if err := m.resolveOrder(); err != nil {
+	order, err := resolveOrder(m.manifests)
+	if err != nil {
 		return nil, err
 	}
-	return m, nil
-}
-
-// resolveOrder topologically sorts extensions so providers start before
-// the extensions that require their capabilities.
-func (m *Manager) resolveOrder() error {
-	provider := map[string]string{} // capability -> owning extension
-	for name, mf := range m.manifests {
-		for _, c := range mf.Provides {
-			if other, ok := provider[c]; ok {
-				return fmt.Errorf("capability %q provided by both %q and %q", c, other, name)
-			}
-			provider[c] = name
-		}
-	}
-	var order []string
-	state := map[string]int{} // 0 unseen, 1 on-stack, 2 done
-	var visit func(name string) error
-	visit = func(name string) error {
-		switch state[name] {
-		case 1:
-			return fmt.Errorf("dependency cycle through extension %q", name)
-		case 2:
-			return nil
-		}
-		state[name] = 1
-		mf := m.manifests[name]
-		for _, req := range mf.Requires {
-			other, ok := provider[req]
-			if !ok {
-				return fmt.Errorf("extension %s requires capability %q which no extension provides", name, req)
-			}
-			if other == name {
-				return fmt.Errorf("extension %s cannot provide its own requirement %q", name, req)
-			}
-			if err := visit(other); err != nil {
-				return err
-			}
-		}
-		state[name] = 2
-		order = append(order, name)
-		return nil
-	}
-	// Deterministic traversal: visit manifests in name order.
-	names := make([]string, 0, len(m.manifests))
-	for name := range m.manifests {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if err := visit(name); err != nil {
-			return err
-		}
-	}
 	m.order = order
-	return nil
+	return m, nil
 }
 
 // Start launches extensions in dependency order and verifies the
@@ -145,36 +94,10 @@ func (m *Manager) Start() error {
 			m.rollback(started)
 			return fmt.Errorf("start %s: %w", name, err)
 		}
-		if inst.name != name {
-			inst.shutdown(0)
+		if err := m.verifyInstance(mf, inst, nil); err != nil {
+			inst.shutdownNow()
 			m.rollback(started)
-			return fmt.Errorf("start %s: binary identified itself as %q", name, inst.name)
-		}
-		// Capability compatibility check before becoming ready:
-		// every declared requirement must be live, and every
-		// advertised capability must be in the manifest.
-		declared := map[string]bool{}
-		for _, c := range mf.Provides {
-			declared[c] = true
-			if _, ok := inst.caps[c]; !ok {
-				inst.shutdown(0)
-				m.rollback(started)
-				return fmt.Errorf("extension %s is incompatible: missing capability %q", name, c)
-			}
-		}
-		for c := range inst.caps {
-			if !declared[c] {
-				inst.shutdown(0)
-				m.rollback(started)
-				return fmt.Errorf("extension %s is incompatible: undeclared capability %q", name, c)
-			}
-		}
-		for _, req := range mf.Requires {
-			if _, ok := m.providers[req]; !ok {
-				inst.shutdown(0)
-				m.rollback(started)
-				return fmt.Errorf("extension %s requires capability %q which is not live", name, req)
-			}
+			return fmt.Errorf("start %s: %w", name, err)
 		}
 		m.instances[name] = inst
 		for _, c := range mf.Provides {
@@ -192,6 +115,246 @@ func (m *Manager) rollback(names []string) {
 			delete(m.instances, names[i])
 		}
 	}
+}
+
+// SwitchResult describes how one extension's old generation ended.
+type SwitchResult struct {
+	Name        string
+	OldVersion  string
+	OldSession  string
+	NewVersion  string
+	NewSession  string
+	DrainReason string
+}
+
+// UpgradeSet performs an atomic handover of the named extensions to new
+// manifests (new binaries/versions). Dependencies that are themselves
+// upgrading are validated as a set: every new process starts and
+// completes identity/capability/dependency verification BEFORE any task
+// routing changes. Only after all new generations are healthy does the
+// manager commit routing; new tasks then go exclusively to the new
+// generations, while each old process keeps serving the tasks it
+// already accepted, drains to a boundary (bye or grace), and exits.
+//
+// If any new process fails to start or verify, all freshly spawned
+// processes are discarded and the old generations remain the sole task
+// owners. A task is never dispatched to two generations.
+func (m *Manager) UpgradeSet(updates []Manifest) ([]SwitchResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, fmt.Errorf("manager is shutting down")
+	}
+
+	upgraded := map[string]bool{}
+	futureManifests := map[string]Manifest{}
+	for name, mf := range m.manifests {
+		futureManifests[name] = mf
+	}
+	for _, mf := range updates {
+		if mf.Name == "" || mf.Path == "" {
+			return nil, fmt.Errorf("manifest with empty name or path")
+		}
+		if _, known := futureManifests[mf.Name]; !known {
+			return nil, fmt.Errorf("cannot upgrade unknown extension %q", mf.Name)
+		}
+		if upgraded[mf.Name] {
+			return nil, fmt.Errorf("duplicate upgrade for extension %q", mf.Name)
+		}
+		upgraded[mf.Name] = true
+		futureManifests[mf.Name] = mf
+	}
+
+	// Statically re-validate the target set: unique providers, no
+	// missing requirements, no cycles among the combined manifests.
+	futureOrder, err := resolveOrder(futureManifests)
+	if err != nil {
+		m.recordSwitchFailures(upgraded, "rejected: "+err.Error())
+		return nil, err
+	}
+
+	// Phase 1: start and verify every new generation while the old ones
+	// keep serving. Nothing is routable yet.
+	newInsts := map[string]*Instance{}
+	names := make([]string, 0, len(updates))
+	for _, name := range futureOrder {
+		if !upgraded[name] {
+			continue
+		}
+		names = append(names, name)
+		mf := futureManifests[name]
+		inst, err := spawn(mf, m.cfg.HandshakeTimeout)
+		if err != nil {
+			m.abortUpgrade(names, newInsts, upgraded, "spawn: "+err.Error())
+			return nil, fmt.Errorf("upgrade %s: %w", name, err)
+		}
+		if err := m.verifyInstance(mf, inst, newInsts); err != nil {
+			inst.shutdownNow()
+			m.abortUpgrade(names, newInsts, upgraded, err.Error())
+			return nil, fmt.Errorf("upgrade %s: %w", name, err)
+		}
+		newInsts[name] = inst
+	}
+
+	// Phase 2: atomic commit. Build the target routing tables first and
+	// publish them together; old generations are detached but running.
+	oldInsts := make(map[string]*Instance, len(names))
+	results := make([]SwitchResult, 0, len(names))
+	for _, name := range names {
+		old := m.instances[name]
+		oldInsts[name] = old
+		mf := futureManifests[name]
+		inst := newInsts[name]
+		res := SwitchResult{Name: name, NewVersion: inst.extVer, NewSession: inst.session}
+		if old != nil {
+			res.OldVersion = old.extVer
+			res.OldSession = old.session
+		}
+		results = append(results, res)
+		m.manifests[name] = mf
+		m.instances[name] = inst
+		for _, c := range mf.Provides {
+			m.providers[c] = name
+		}
+	}
+	m.order = futureOrder
+
+	// Phase 3: drain and stop old generations, in reverse dependency
+	// order (dependents stop before their providers). New tasks are
+	// already owned solely by the new generations because this method
+	// holds m.mu for its whole duration, so no Call can route to an old
+	// process concurrently.
+	for i := len(results) - 1; i >= 0; i-- {
+		name := results[i].Name
+		old := oldInsts[name]
+		reason := "absent"
+		if old != nil {
+			reason = old.terminate(m.cfg.ShutdownGrace, ErrRetired)
+		}
+		results[i].DrainReason = reason
+		m.recordSwitch(SwitchEntry{
+			Extension:  name,
+			Action:     "upgraded",
+			Result:     "committed",
+			OldVersion: results[i].OldVersion,
+			OldSession: results[i].OldSession,
+			NewVersion: results[i].NewVersion,
+			NewSession: results[i].NewSession,
+			Drain:      reason,
+		})
+	}
+	return results, nil
+}
+
+// verifyInstance applies the identity, capability and liveness checks
+// to a freshly spawned instance. liveNew holds other generations that
+// are upgrading in the same set; dependencies are considered live if
+// they are either an already-verified new generation or an untouched
+// existing instance.
+func (m *Manager) verifyInstance(mf Manifest, inst *Instance, liveNew map[string]*Instance) error {
+	if inst.name != mf.Name {
+		return fmt.Errorf("binary identified itself as %q", inst.name)
+	}
+	declared := map[string]bool{}
+	for _, c := range mf.Provides {
+		declared[c] = true
+		if _, ok := inst.caps[c]; !ok {
+			return fmt.Errorf("incompatible: missing capability %q", c)
+		}
+	}
+	for c := range inst.caps {
+		if !declared[c] {
+			return fmt.Errorf("incompatible: undeclared capability %q", c)
+		}
+	}
+	for _, req := range mf.Requires {
+		provider, ok := m.providers[req]
+		if !ok {
+			return fmt.Errorf("requires capability %q which is not live", req)
+		}
+		if _, fresh := liveNew[provider]; !fresh {
+			if existing := m.instances[provider]; existing == nil {
+				return fmt.Errorf("requires capability %q whose provider is not live", req)
+			}
+		}
+	}
+	return nil
+}
+
+// abortUpgrade discards freshly spawned generations and records that
+// the old versions were retained.
+func (m *Manager) abortUpgrade(names []string, fresh map[string]*Instance, upgraded map[string]bool, detail string) {
+	for i := len(names) - 1; i >= 0; i-- {
+		name := names[i]
+		if inst, ok := fresh[name]; ok {
+			inst.shutdownNow()
+		}
+	}
+	m.recordSwitchFailures(upgraded, detail)
+}
+
+func (m *Manager) recordSwitchFailures(upgraded map[string]bool, detail string) {
+	for name := range upgraded {
+		old := m.instances[name]
+		e := SwitchEntry{Extension: name, Action: "upgrade_failed", Result: "retained_old", Detail: detail}
+		if old != nil {
+			e.OldVersion = old.extVer
+			e.OldSession = old.session
+		}
+		m.recordSwitch(e)
+	}
+}
+
+// resolveOrder topologically sorts manifests so providers start before
+// the extensions that require them.
+func resolveOrder(manifests map[string]Manifest) ([]string, error) {
+	provider := map[string]string{}
+	for name, mf := range manifests {
+		for _, c := range mf.Provides {
+			if other, ok := provider[c]; ok {
+				return nil, fmt.Errorf("capability %q provided by both %q and %q", c, other, name)
+			}
+			provider[c] = name
+		}
+	}
+	var order []string
+	state := map[string]int{}
+	var visit func(string) error
+	visit = func(name string) error {
+		switch state[name] {
+		case 1:
+			return fmt.Errorf("dependency cycle through extension %q", name)
+		case 2:
+			return nil
+		}
+		state[name] = 1
+		for _, req := range manifests[name].Requires {
+			other, ok := provider[req]
+			if !ok {
+				return fmt.Errorf("extension %s requires capability %q which no extension provides", name, req)
+			}
+			if other == name {
+				return fmt.Errorf("extension %s cannot provide its own requirement %q", name, req)
+			}
+			if err := visit(other); err != nil {
+				return err
+			}
+		}
+		state[name] = 2
+		order = append(order, name)
+		return nil
+	}
+	names := make([]string, 0, len(manifests))
+	for name := range manifests {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if err := visit(name); err != nil {
+			return nil, err
+		}
+	}
+	return order, nil
 }
 
 // Call dispatches one task to the extension providing the capability.
@@ -225,9 +388,14 @@ func (m *Manager) Call(capability string, payload any) (json.RawMessage, error) 
 	}
 	resp, err := inst.call(id, capability, raw, m.cfg.TaskTimeout)
 	if err != nil {
-		if errors.Is(err, ErrCrashed) {
+		switch {
+		case errors.Is(err, ErrCrashed):
 			entry.Status = "crashed"
-		} else {
+		case errors.Is(err, ErrRetired):
+			entry.Status = "retired"
+		case errors.Is(err, ErrShutdown):
+			entry.Status = "shutdown"
+		default:
 			entry.Status = "timeout"
 		}
 		entry.Detail = err.Error()
@@ -235,9 +403,14 @@ func (m *Manager) Call(capability string, payload any) (json.RawMessage, error) 
 		return nil, err
 	}
 	if resp.Type == protocol.TypeError {
-		if resp.Err == ErrCrashed.Error() {
+		switch resp.Err {
+		case ErrCrashed.Error():
 			entry.Status = "crashed"
-		} else {
+		case ErrRetired.Error():
+			entry.Status = "retired"
+		case ErrShutdown.Error():
+			entry.Status = "shutdown"
+		default:
 			entry.Status = "error"
 		}
 		entry.Detail = resp.Err
@@ -254,7 +427,7 @@ func (m *Manager) Alive(name string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	inst, ok := m.instances[name]
-	return ok && inst.alive
+	return ok && inst.isAlive()
 }
 
 // Restart replaces a dead extension process with a fresh one. The new
@@ -273,7 +446,7 @@ func (m *Manager) Restart(name string) error {
 				delete(m.providers, capName)
 			}
 		}
-		old.shutdown(m.cfg.ShutdownGrace)
+		old.terminate(m.cfg.ShutdownGrace, ErrRetired)
 		delete(m.instances, name)
 	}
 	inst, err := spawn(mf, m.cfg.HandshakeTimeout)
@@ -307,21 +480,55 @@ func (m *Manager) Shutdown() {
 		return
 	}
 	m.closed = true
-	m.mu.Unlock()
+	reasons := map[string]string{}
+	m.shutdownReasons = reasons
 
 	for i := len(m.order) - 1; i >= 0; i-- {
 		name := m.order[i]
-		m.mu.Lock()
 		inst := m.instances[name]
-		m.mu.Unlock()
 		if inst != nil {
-			inst.shutdown(m.cfg.ShutdownGrace)
+			reason := inst.terminate(m.cfg.ShutdownGrace, ErrShutdown)
+			reasons[name] = reason
+			result := "drained"
+			if reason == "grace_killed" {
+				result = "grace_killed"
+			} else if reason == "exited" || reason == "already_exited" {
+				result = "exited"
+			}
+			m.recordSwitch(SwitchEntry{
+				Extension:  name,
+				Action:     "shutdown",
+				Result:     result,
+				OldVersion: inst.extVer,
+				OldSession: inst.session,
+				Drain:      reason,
+			})
 		}
 	}
+	m.mu.Unlock()
+}
+
+// ShutdownReasons reports the explicit termination reason recorded for
+// each extension at host shutdown (drained | exited | grace_killed |
+// already_exited | absent).
+func (m *Manager) ShutdownReasons() map[string]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range m.shutdownReasons {
+		out[k] = v
+	}
+	return out
 }
 
 func (m *Manager) record(e JournalEntry) {
 	if m.cfg.Journal != nil {
 		m.cfg.Journal.Record(e)
+	}
+}
+
+func (m *Manager) recordSwitch(e SwitchEntry) {
+	if m.cfg.Journal != nil {
+		m.cfg.Journal.RecordSwitch(e)
 	}
 }
