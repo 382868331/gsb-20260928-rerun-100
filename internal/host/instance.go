@@ -19,6 +19,11 @@ import (
 // dies before answering them.
 var ErrCrashed = errors.New("extension process exited")
 
+// reapTimeout bounds how long the host waits for the process to
+// actually vanish after a negotiated bye. It is deliberately separate
+// from the drain grace, which bounds the extension's own cleanup.
+const reapTimeout = 5 * time.Second
+
 type pendingCall struct {
 	ch chan *protocol.Message
 }
@@ -37,6 +42,7 @@ type Instance struct {
 	mu      sync.Mutex
 	pending map[string]*pendingCall
 	alive   bool
+	writeMu sync.Mutex
 
 	bye chan struct{} // closed when the extension sends bye
 }
@@ -45,10 +51,10 @@ type Instance struct {
 type EndReason string
 
 const (
-	EndExited     EndReason = "exited"      // process exited of its own accord
-	EndBye        EndReason = "bye"         // drained and sent bye
-	EndGraceKill  EndReason = "grace_kill"  // exceeded grace/drain boundary
-	EndHostClose  EndReason = "host_close"  // host shutdown interrupted the wait
+	EndExited    EndReason = "exited"     // process exited of its own accord
+	EndBye       EndReason = "bye"        // drained and sent bye
+	EndGraceKill EndReason = "grace_kill" // exceeded grace/drain boundary
+	EndHostClose EndReason = "host_close" // host shutdown interrupted the wait
 )
 
 func newSessionToken() string {
@@ -93,7 +99,7 @@ func spawn(mf Manifest, handshakeTimeout time.Duration) (*Instance, error) {
 		Protocol: protocol.Version,
 		Session:  inst.session,
 	}
-	if err := protocol.Encode(stdin, hello); err != nil {
+	if err := inst.write(stdin, hello); err != nil {
 		_ = cmd.Process.Kill()
 		return nil, fmt.Errorf("send hello: %w", err)
 	}
@@ -208,7 +214,7 @@ func (inst *Instance) call(id, capability string, payload json.RawMessage, timeo
 		Cap:     capability,
 		Payload: payload,
 	}
-	if err := protocol.Encode(inst.stdin, msg); err != nil {
+	if err := inst.write(inst.stdin, msg); err != nil {
 		inst.mu.Lock()
 		delete(inst.pending, id)
 		inst.mu.Unlock()
@@ -226,11 +232,27 @@ func (inst *Instance) call(id, capability string, payload json.RawMessage, timeo
 	}
 }
 
+// write serialises framed writes to the child's stdin. A shutdown
+// directive sent while a task is being dispatched must never interleave
+// with the task's JSON line.
+func (inst *Instance) write(w io.Writer, msg *protocol.Message) error {
+	inst.writeMu.Lock()
+	defer inst.writeMu.Unlock()
+	return protocol.Encode(w, msg)
+}
+
 // inFlight reports how many tasks have been dispatched but not answered.
 func (inst *Instance) inFlight() int {
 	inst.mu.Lock()
 	defer inst.mu.Unlock()
 	return len(inst.pending)
+}
+
+// isAlive reports whether the process is still running.
+func (inst *Instance) isAlive() bool {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	return inst.alive
 }
 
 // waitExit blocks until the process exits, the deadline elapses, or
@@ -240,6 +262,13 @@ func (inst *Instance) inFlight() int {
 func (inst *Instance) waitExit(deadline <-chan time.Time, stop <-chan struct{}) EndReason {
 	select {
 	case <-inst.done:
+		// The extension may have exited in the same instant it sent
+		// bye. Prefer the negotiated close when both signals are ready.
+		select {
+		case <-inst.bye:
+			return EndBye
+		default:
+		}
 		return EndExited
 	default:
 	}
@@ -247,10 +276,16 @@ func (inst *Instance) waitExit(deadline <-chan time.Time, stop <-chan struct{}) 
 	case <-inst.done:
 		return EndExited
 	case <-inst.bye:
+		// The extension keeps running until the host closes stdin:
+		// that ordering guarantees the bye line was observed. Close the
+		// pipe. Process reaping after the negotiated close is bounded
+		// separately so a slow runtime shutdown does not eat into the
+		// drain grace budget.
+		_ = inst.stdin.Close()
 		select {
 		case <-inst.done:
 			return EndBye
-		case <-deadlineOrNil(deadline):
+		case <-time.After(reapTimeout):
 			_ = inst.cmd.Process.Kill()
 			<-inst.done
 			return EndGraceKill
@@ -293,10 +328,11 @@ func (inst *Instance) signalShutdown() bool {
 	if !alive {
 		return false
 	}
-	_ = protocol.Encode(inst.stdin, &protocol.Message{
+	if err := inst.write(inst.stdin, &protocol.Message{
 		Type:    protocol.TypeShutdown,
 		Session: inst.session,
-	})
+	}); err != nil {
+	}
 	return true
 }
 

@@ -8,12 +8,28 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
+	"time"
 
 	"extsys/internal/extsdk"
 )
 
 func main() {
-	ext := extsdk.New("hashkit", "0.9.1")
+	version := os.Getenv("HASHKIT_VERSION")
+	if version == "" {
+		version = "0.9.1"
+	}
+
+	ext := extsdk.New("hashkit", version)
+	if d := os.Getenv("HASHKIT_SHUTDOWN_DELAY_MS"); d != "" {
+		if millis, err := strconv.Atoi(d); err == nil {
+			ext.OnShutdown = func() { time.Sleep(time.Duration(millis) * time.Millisecond) }
+		}
+	}
+
+	ext.Handle("hashwho", 1, func(p json.RawMessage) (any, error) {
+		return map[string]string{"extension": "hashkit", "version": version}, nil
+	})
 
 	ext.Handle("sha256", 1, func(p json.RawMessage) (any, error) {
 		var in struct {

@@ -46,12 +46,12 @@ func main() {
 		{
 			Name:     "hashkit",
 			Path:     filepath.Join(binDir, "hashkit"),
-			Provides: []string{"sha256", "reverse"},
+			Provides: []string{"sha256", "reverse", "hashwho"},
 		},
 		{
 			Name:     "textkit",
 			Path:     filepath.Join(binDir, "textkit"),
-			Provides: []string{"uppercase", "wordcount", "sleep", "panic"},
+			Provides: []string{"uppercase", "wordcount", "sleep", "panic", "textwho"},
 			// textkit's hashupper pipeline depends on hashkit, so it
 			// must start after hashkit and only if sha256 is live.
 			Requires: []string{"sha256"},

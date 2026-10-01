@@ -6,6 +6,7 @@ package extsdk
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 
 	"extsys/internal/protocol"
@@ -24,6 +25,11 @@ type Extension struct {
 	Name    string
 	Version string
 	caps    map[string]capability
+	// OnShutdown, if set, runs after the last accepted task has
+	// finished and before the bye acknowledgement is sent. It models
+	// the extension's own drain/cleanup work; a slow hook lets a host
+	// exercise the agreed drain boundary.
+	OnShutdown func()
 }
 
 // New creates an extension with the given name and semantic version.
@@ -82,11 +88,20 @@ func (e *Extension) Run() error {
 			e.dispatch(&msg)
 		case protocol.TypeShutdown:
 			// Stop accepting new work; nothing else is in flight
-			// because dispatch is sequential. Acknowledge and exit.
+			// because dispatch is sequential. Run any extension-owned
+			// cleanup, then acknowledge and exit.
+			if e.OnShutdown != nil {
+				e.OnShutdown()
+			}
 			_ = protocol.Encode(os.Stdout, &protocol.Message{
 				Type:    protocol.TypeBye,
 				Session: session,
 			})
+			// Handshake the actual exit: flush the bye, then wait for
+			// the host to close stdin so it is guaranteed to have
+			// observed the bye line before the process vanishes.
+			_ = os.Stdout.Sync()
+			io.Copy(io.Discard, os.Stdin)
 			return nil
 		}
 	}

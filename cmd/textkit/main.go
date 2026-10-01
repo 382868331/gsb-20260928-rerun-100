@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,7 +15,16 @@ import (
 )
 
 func main() {
-	ext := extsdk.New("textkit", "1.2.0")
+	version := os.Getenv("TEXTKIT_VERSION")
+	if version == "" {
+		version = "1.2.0"
+	}
+	ext := extsdk.New("textkit", version)
+	if d := os.Getenv("TEXTKIT_SHUTDOWN_DELAY_MS"); d != "" {
+		if millis, err := strconv.Atoi(d); err == nil {
+			ext.OnShutdown = func() { time.Sleep(time.Duration(millis) * time.Millisecond) }
+		}
+	}
 
 	ext.Handle("uppercase", 1, func(p json.RawMessage) (any, error) {
 		var in struct {
@@ -54,6 +64,10 @@ func main() {
 	ext.Handle("panic", 1, func(p json.RawMessage) (any, error) {
 		os.Exit(2)
 		return nil, nil
+	})
+
+	ext.Handle("textwho", 1, func(p json.RawMessage) (any, error) {
+		return map[string]string{"extension": "textkit", "version": version}, nil
 	})
 
 	if err := ext.Run(); err != nil {

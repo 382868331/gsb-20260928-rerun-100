@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,8 +52,8 @@ type Manager struct {
 	taskSeq   int
 	switchSeq int
 	closed    bool
-	stopCh    chan struct{}     // closed when host shutdown begins
-	retired   []*Instance       // old incarnations draining in flight
+	stopCh    chan struct{} // closed when host shutdown begins
+	retired   []*Instance   // old incarnations draining in flight
 
 	upgradeMu sync.Mutex // serialises overlapping upgrade attempts
 	upgrading sync.WaitGroup
@@ -144,21 +145,10 @@ func resolveOrder(manifests map[string]Manifest) ([]string, error) {
 	sort.Strings(names)
 	for _, name := range names {
 		if err := visit(name); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	return order, nil
-}
-
-// stop is closed during Shutdown so long-running upgrade preparations
-// end with an explicit reason instead of blocking forever.
-func (m *Manager) stop() <-chan struct{} {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.stopCh == nil {
-		m.stopCh = make(chan struct{})
-	}
-	return m.stopCh
 }
 
 // Start launches extensions in dependency order and verifies the
@@ -285,9 +275,9 @@ func (m *Manager) Call(capability string, payload any) (json.RawMessage, error) 
 // Alive reports whether the extension process is still running.
 func (m *Manager) Alive(name string) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	inst, ok := m.instances[name]
-	return ok && inst.alive
+	m.mu.Unlock()
+	return ok && inst.isAlive()
 }
 
 // Restart replaces a dead extension process with a fresh one. The new
@@ -339,6 +329,16 @@ type stagedItem struct {
 // exits + new version fails to start" safe: a failure anywhere before
 // cutover tears down only the candidates, while the running versions
 // (including any that crashed independently) remain the task owners.
+//
+// Session identities never carry over: each spawned candidate gets a
+// fresh random token, so two consecutive upgrades, or a retry after a
+// failed attempt, can never reuse an old session. The returned error is
+// nil only when cutover succeeded AND every retired process ended for
+// the expected reason (clean shutdown within grace). If some old session
+// exited on its own, had to be killed past the drain boundary, or was
+// killed because the host closed, Upgrade returns an error describing
+// the real end reasons and records "upgrade_incomplete": traffic has
+// already moved to the new builds, but the handoff was not fully clean.
 func (m *Manager) Upgrade(candidates []Manifest) error {
 	m.upgradeMu.Lock()
 	m.upgrading.Add(1)
@@ -353,8 +353,10 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	m.switchSeq++
 	upgradeID := fmt.Sprintf("upgrade-%d", m.switchSeq)
 	stop := m.stopLocked()
-	oldOrder := append([]string{}, m.order...)
 	m.mu.Unlock()
+	if len(candidates) == 0 {
+		return fmt.Errorf("upgrade requires at least one candidate")
+	}
 
 	// Build the post-upgrade manifest set: candidates replace existing
 	// manifests with the same name; other extensions are kept.
@@ -362,7 +364,15 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	for name, mf := range m.manifests {
 		next[name] = mf
 	}
+	seen := map[string]bool{}
 	for _, mf := range candidates {
+		if mf.Name == "" || mf.Path == "" {
+			return fmt.Errorf("candidate with empty name or path")
+		}
+		if seen[mf.Name] {
+			return fmt.Errorf("duplicate candidate %q", mf.Name)
+		}
+		seen[mf.Name] = true
 		if _, known := next[mf.Name]; !known {
 			return fmt.Errorf("upgrade unknown extension %q", mf.Name)
 		}
@@ -371,7 +381,8 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	order, err := resolveOrder(next)
 	if err != nil {
 		for _, mf := range candidates {
-			m.recordSwitch(SwitchAbort, upgradeID, mf.Name, nil, nil, err.Error())
+			m.recordSwitch(SwitchAbort, upgradeID, mf.Name, m.instances[mf.Name], nil,
+				"candidate set rejected by topology check: "+err.Error())
 		}
 		return err
 	}
@@ -383,17 +394,11 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	for c, p := range m.providers {
 		liveProviders[c] = p
 	}
-	items := make([]stagedItem, 0, len(candidates))
+	staged := make([]stagedItem, 0, len(candidates))
 	byName := map[string]*stagedItem{}
 	for _, mf := range candidates {
-		item := &stagedItem{name: mf.Name, old: m.instances[mf.Name]}
-		items = append(items, *item)
-	}
-	// Rebuild pointers into a stable backing slice.
-	staged := make([]stagedItem, len(items))
-	for i := range items {
-		staged[i] = items[i]
-		byName[items[i].name] = &staged[i]
+		staged = append(staged, stagedItem{name: mf.Name, old: m.instances[mf.Name]})
+		byName[mf.Name] = &staged[len(staged)-1]
 	}
 	m.mu.Unlock()
 
@@ -413,7 +418,6 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 		}
 	}
 
-	prepared := map[string]*Instance{}
 	for _, name := range order {
 		item := byName[name]
 		if item == nil {
@@ -422,18 +426,17 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 		mf := next[name]
 		inst, spawnErr := m.spawnCandidate(mf, stop)
 		if spawnErr != nil {
-			m.abortUpgrade(upgradeID, staged, prepared, spawnErr, stop)
+			m.abortUpgrade(upgradeID, staged, spawnErr, stop)
 			return spawnErr
 		}
 		if err := m.verifyInstance(mf, inst, candidateProviders); err != nil {
-			inst.shutdown(0)
-			m.abortUpgrade(upgradeID, staged, prepared, err, stop)
+			inst.killNow()
+			m.abortUpgrade(upgradeID, staged, err, stop)
 			return err
 		}
 		item.new = inst
-		prepared[name] = inst
-		old := item.old
-		m.recordSwitch(SwitchPrepared, upgradeID, name, old, inst, "handshake and capability checks passed")
+		m.recordSwitch(SwitchPrepared, upgradeID, name, item.old, inst,
+			"candidate confirmed: handshake, identity and capability checks passed")
 	}
 
 	// All candidates are valid. Cut over atomically: new tasks now go
@@ -443,7 +446,7 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	if m.closed {
 		m.mu.Unlock()
 		closeErr := fmt.Errorf("host closed before cutover")
-		m.abortUpgrade(upgradeID, staged, prepared, closeErr, stop)
+		m.abortUpgrade(upgradeID, staged, closeErr, stop)
 		return closeErr
 	}
 	for i := range staged {
@@ -453,42 +456,64 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 		}
 		m.instances[item.name] = item.new
 		m.manifests[item.name] = next[item.name]
-		m.recordSwitchLocked(SwitchCutover, upgradeID, item.name, item.old, item.new, "new tasks route to new version")
+		m.recordSwitch(SwitchCutover, upgradeID, item.name, item.old, item.new,
+			"all candidates confirmed; new tasks now route to new version")
 	}
 	m.order = order
 	m.mu.Unlock()
 
 	// Drain old incarnations in reverse dependency order so providers
-	// outlive their dependents during the handoff. The drain ends for
-	// an explicit reason: clean bye/exit, the agreed grace boundary, or
-	// host shutdown.
-	for i := len(order) - 1; i >= 0; i-- {
-		item := byName[order[i]]
-		if item == nil || item.old == nil {
+	// outlive their dependents during the handoff. Every drain ends for
+	// an explicit, recorded reason. "migrated" is recorded per
+	// extension only when its old session ended as agreed; a self-exit,
+	// a grace kill or a host-close kill keeps the upgrade from being
+	// declared fully complete, even though traffic is already on the
+	// new builds.
+	var badReasons []string
+	for i := len(staged) - 1; i >= 0; i-- {
+		item := &staged[i]
+		old := item.old
+		if old == nil {
+			m.recordSwitch(SwitchMigrated, upgradeID, item.name, nil, item.new,
+				"no previous incarnation; new version live")
 			continue
 		}
-		old := item.old
 		reason := old.drain(m.cfg.ShutdownGrace, stop)
-		switchDetail := string(reason)
-		event := SwitchDrained
-		switch {
-		case reason == EndGraceKill:
-			event = SwitchDrainKilled
-			switchDetail = "drain boundary exceeded; old process killed"
-		case reason == EndHostClose:
-			event = SwitchHostClose
-			switchDetail = "host closed; old process killed"
-		}
-		m.recordSwitch(event, upgradeID, item.name, old, item.new, switchDetail)
+		event, detail := drainEvent(reason)
+		m.recordSwitch(event, upgradeID, item.name, old, item.new, detail)
 		m.mu.Lock()
 		m.retired = removeInstance(m.retired, old)
 		m.mu.Unlock()
+		if reason == EndBye {
+			m.recordSwitch(SwitchMigrated, upgradeID, item.name, old, item.new,
+				"old session drained within the agreed boundary; new version live")
+		} else {
+			badReasons = append(badReasons, fmt.Sprintf("%s old session ended: %s (%s)", item.name, reason, detail))
+		}
 	}
-	for i := len(staged) - 1; i >= 0; i-- {
-		item := &staged[i]
-		m.recordSwitch(SwitchActivated, upgradeID, item.name, item.old, item.new, "handoff complete")
+	if len(badReasons) == 0 {
+		m.recordSwitch(SwitchComplete, upgradeID, "", nil, nil, "every extension migrated cleanly")
+		return nil
 	}
-	return nil
+	m.recordSwitch(SwitchIncomplete, upgradeID, "", nil, nil, strings.Join(badReasons, "; "))
+	return fmt.Errorf("upgrade cut over, but handoff was not clean: %s", strings.Join(badReasons, "; "))
+}
+
+// drainEvent maps the observed end reason of a retired process to the
+// audit event and a human-readable explanation.
+func drainEvent(reason EndReason) (event, detail string) {
+	switch reason {
+	case EndBye:
+		return SwitchDrained, "old process acknowledged shutdown and exited within grace"
+	case EndExited:
+		return SwitchDrainExited, "old process exited on its own during drain (no handshake close)"
+	case EndGraceKill:
+		return SwitchDrainKilled, "old process exceeded the agreed drain boundary; killed"
+	case EndHostClose:
+		return SwitchHostClose, "host closed during drain; old process killed"
+	default:
+		return string(reason), string(reason)
+	}
 }
 
 // spawnCandidate spawns one candidate but aborts promptly with an
@@ -518,19 +543,26 @@ func (m *Manager) spawnCandidate(mf Manifest, stop <-chan struct{}) (*Instance, 
 }
 
 // abortUpgrade tears down every prepared candidate in reverse order
-// and records that the old version was retained. It never touches the
-// running instances, so task ownership stays with the old build.
-func (m *Manager) abortUpgrade(upgradeID string, staged []stagedItem, prepared map[string]*Instance, cause error, stop <-chan struct{}) {
+// and records that the old version was retained. Candidates that never
+// spawned are reported as cancelled. It never touches the running
+// instances, so task ownership stays with the old build even when an
+// old process exited independently during preparation.
+func (m *Manager) abortUpgrade(upgradeID string, staged []stagedItem, cause error, stop <-chan struct{}) {
 	for i := len(staged) - 1; i >= 0; i-- {
 		item := &staged[i]
-		new := item.new
-		if new == nil {
-			m.recordSwitch(SwitchAbort, upgradeID, item.name, item.old, nil, cause.Error())
+		cand := item.new
+		if cand == nil {
+			detail := fmt.Sprintf("candidate cancelled before cutover (%v)", cause)
+			if item.old != nil {
+				detail += "; old version still serving"
+			}
+			m.recordSwitch(SwitchAbort, upgradeID, item.name, item.old, nil, detail)
 			continue
 		}
-		reason := new.drain(m.cfg.ShutdownGrace, stop)
-		m.recordSwitch(SwitchRollback, upgradeID, item.name, item.old, new,
-			fmt.Sprintf("candidate rejected (%v); removed (%s); old version retained", cause, reason))
+		reason := cand.drain(m.cfg.ShutdownGrace, stop)
+		_, drainDetail := drainEvent(reason)
+		m.recordSwitch(SwitchRollback, upgradeID, item.name, item.old, cand,
+			fmt.Sprintf("candidate rejected before cutover (%v); candidate removed: %s; old version retained", cause, drainDetail))
 	}
 }
 
@@ -558,10 +590,6 @@ func (m *Manager) recordSwitch(event, upgradeID, name string, old, new *Instance
 	m.cfg.Journal.Switch(rec)
 }
 
-func (m *Manager) recordSwitchLocked(event, upgradeID, name string, old, new *Instance, detail string) {
-	m.recordSwitch(event, upgradeID, name, old, new, detail)
-}
-
 // stopLocked returns the shutdown signal channel, creating it.
 func (m *Manager) stopLocked() <-chan struct{} {
 	if m.stopCh == nil {
@@ -580,6 +608,17 @@ func (m *Manager) Session(name string) string {
 	return ""
 }
 
+// Version returns the version string of the build currently serving
+// an extension, as advertised in its handshake.
+func (m *Manager) Version(name string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if inst, ok := m.instances[name]; ok {
+		return inst.extVer
+	}
+	return ""
+}
+
 // Shutdown stops accepting new calls, then shuts extensions down in
 // reverse start order: each drains and exits voluntarily and is killed
 // only if it exceeds the grace period.
@@ -590,16 +629,34 @@ func (m *Manager) Shutdown() {
 		return
 	}
 	m.closed = true
+	if m.stopCh == nil {
+		m.stopCh = make(chan struct{})
+	}
+	close(m.stopCh)
 	m.mu.Unlock()
 
-	for i := len(m.order) - 1; i >= 0; i-- {
-		name := m.order[i]
-		m.mu.Lock()
-		inst := m.instances[name]
-		m.mu.Unlock()
-		if inst != nil {
-			inst.shutdown(m.cfg.ShutdownGrace)
+	// Wait for an in-progress upgrade to reach a stable point
+	// (cutover or rollback) so no instance is supervised twice.
+	m.upgrading.Wait()
+
+	m.mu.Lock()
+	order := append([]string{}, m.order...)
+	live := make([]*Instance, 0, len(order))
+	for _, name := range order {
+		if inst := m.instances[name]; inst != nil {
+			live = append(live, inst)
 		}
+	}
+	retired := append([]*Instance{}, m.retired...)
+	m.mu.Unlock()
+
+	for i := len(live) - 1; i >= 0; i-- {
+		live[i].shutdown(m.cfg.ShutdownGrace)
+	}
+	// Old incarnations still draining from a finished cutover also get
+	// an explicit, grace-bounded stop.
+	for _, inst := range retired {
+		inst.killNow()
 	}
 }
 
