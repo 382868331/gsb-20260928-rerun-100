@@ -14,7 +14,11 @@ import (
 )
 
 func main() {
-	ext := extsdk.New("textkit", "1.2.0")
+	version := os.Getenv("TEXTKIT_VERSION")
+	if version == "" {
+		version = "1.2.0"
+	}
+	ext := extsdk.New("textkit", version)
 
 	ext.Handle("uppercase", 1, func(p json.RawMessage) (any, error) {
 		var in struct {

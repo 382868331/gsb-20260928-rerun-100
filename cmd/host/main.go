@@ -94,6 +94,67 @@ func main() {
 	fmt.Println("[task] uppercase after restart ->",
 		mustJSON(mgr.Call("uppercase", map[string]string{"text": "back online"})))
 
+	// --- Dependency-ordered upgrade -------------------------------
+	// Both extensions move to a new build (same trusted local binary,
+	// new version stamp). Old processes keep serving while candidates
+	// are spawned and verified; only after every candidate passes the
+	// handshake does traffic cut over.
+	oldTextkit, oldHashkit := mgr.Session("textkit"), mgr.Session("hashkit")
+	fmt.Println("[task] uppercase before upgrade ->",
+		mustJSON(mgr.Call("uppercase", map[string]string{"text": "served by old build"})))
+	upgrade := []host.Manifest{
+		{
+			Name:     "hashkit",
+			Path:     filepath.Join(binDir, "hashkit"),
+			Env:      []string{"HASHKIT_VERSION=0.9.2"},
+			Provides: []string{"sha256", "reverse"},
+		},
+		{
+			Name:     "textkit",
+			Path:     filepath.Join(binDir, "textkit"),
+			Env:      []string{"TEXTKIT_VERSION=1.3.0"},
+			Provides: []string{"uppercase", "wordcount", "sleep", "panic"},
+			Requires: []string{"sha256"},
+		},
+	}
+	if err := mgr.Upgrade(upgrade); err != nil {
+		log.Fatalf("upgrade failed, old combination must still serve: %v", err)
+	}
+	fmt.Printf("[host] upgrade cut over: textkit %s... -> %s..., hashkit %s... -> %s...\n",
+		oldTextkit[:8], mgr.Session("textkit")[:8], oldHashkit[:8], mgr.Session("hashkit")[:8])
+	fmt.Println("[task] uppercase after upgrade ->",
+		mustJSON(mgr.Call("uppercase", map[string]string{"text": "served by new build"})))
+
+	// --- Failed upgrade keeps the old combination -------------------
+	// This candidate declares a capability the binary does not
+	// implement, so it is rejected during preparation. The running
+	// versions are never touched.
+	broken := []host.Manifest{{
+		Name:     "textkit",
+		Path:     filepath.Join(binDir, "textkit"),
+		Env:      []string{"TEXTKIT_VERSION=9.9.9"},
+		Provides: []string{"uppercase", "wordcount", "sleep", "panic", "fly"},
+		Requires: []string{"sha256"},
+	}}
+	before := mgr.Session("textkit")
+	if err := mgr.Upgrade(broken); err != nil {
+		fmt.Println("[host] bad candidate rejected, old combination retained:", err)
+	}
+	if mgr.Session("textkit") != before {
+		log.Fatal("failed upgrade must not replace the running session")
+	}
+	fmt.Println("[task] uppercase after failed upgrade ->",
+		mustJSON(mgr.Call("uppercase", map[string]string{"text": "still the retained build"})))
+
+	// --- Handoff audit trail ----------------------------------------
+	fmt.Println("[host] upgrade audit trail:")
+	for _, rec := range journal.SwitchRecords() {
+		fmt.Printf("  [%s] %-9s %-8s old=%s(%s) new=%s(%s) %s\n",
+			rec.UpgradeID, rec.Event, rec.Extension,
+			short(rec.OldVersion), short(rec.OldSession),
+			short(rec.NewVersion), short(rec.NewSession), rec.Detail)
+	}
+
 	// --- Timeout supervision --------------------------------------
 	fmt.Println("[task] sleep(5s, timeout 1.5s) ->", mustJSON(mgr.Call("sleep", map[string]int{"millis": 5000})))
 	fmt.Println("[host] still alive after slow task; other extension unaffected:",
@@ -103,4 +164,14 @@ func main() {
 	fmt.Println("[host] shutting down: stop accepting, drain, exit")
 	mgr.Shutdown()
 	fmt.Println("[host] all extensions exited cleanly; task journal at state/tasks.jsonl")
+}
+
+func short(s string) string {
+	if s == "" {
+		return "-"
+	}
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
 }

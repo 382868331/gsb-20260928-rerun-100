@@ -144,7 +144,7 @@ func resolveOrder(manifests map[string]Manifest) ([]string, error) {
 	sort.Strings(names)
 	for _, name := range names {
 		if err := visit(name); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	return order, nil
@@ -353,7 +353,6 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	m.switchSeq++
 	upgradeID := fmt.Sprintf("upgrade-%d", m.switchSeq)
 	stop := m.stopLocked()
-	oldOrder := append([]string{}, m.order...)
 	m.mu.Unlock()
 
 	// Build the post-upgrade manifest set: candidates replace existing

@@ -13,7 +13,11 @@ import (
 )
 
 func main() {
-	ext := extsdk.New("hashkit", "0.9.1")
+	version := os.Getenv("HASHKIT_VERSION")
+	if version == "" {
+		version = "0.9.1"
+	}
+	ext := extsdk.New("hashkit", version)
 
 	ext.Handle("sha256", 1, func(p json.RawMessage) (any, error) {
 		var in struct {
