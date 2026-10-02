@@ -20,6 +20,46 @@ func main() {
 	}
 	ext := extsdk.New("textkit", version)
 
+	// Stateful session: a counter plus a legacy note. Newer builds
+	// (TEXTKIT_DROP_LEGACY=1) no longer understand the legacy note, so
+	// upgrades must surface it as an incompatible state item.
+	counter := 0
+	ext.Handle("count", 1, func(p json.RawMessage) (any, error) {
+		counter++
+		return map[string]int{"count": counter}, nil
+	})
+	ext.StateHooks(
+		func() map[string]json.RawMessage {
+			n, _ := json.Marshal(counter)
+			return map[string]json.RawMessage{
+				"counter":     n,
+				"legacy_note": json.RawMessage(`"draft-format-v1"`),
+			}
+		},
+		func(items map[string]json.RawMessage) (map[string]json.RawMessage, map[string]string) {
+			accepted := map[string]json.RawMessage{}
+			rejected := map[string]string{}
+			for k, v := range items {
+				if k == "legacy_note" && os.Getenv("TEXTKIT_DROP_LEGACY") == "1" {
+					rejected[k] = "draft-format-v1 notes are not supported by this build"
+					continue
+				}
+				accepted[k] = v
+			}
+			return accepted, rejected
+		},
+		func(items map[string]json.RawMessage) error {
+			if raw, ok := items["counter"]; ok {
+				var n int
+				if err := json.Unmarshal(raw, &n); err != nil {
+					return err
+				}
+				counter = n
+			}
+			return nil
+		},
+	)
+
 	ext.Handle("uppercase", 1, func(p json.RawMessage) (any, error) {
 		var in struct {
 			Text string `json:"text"`

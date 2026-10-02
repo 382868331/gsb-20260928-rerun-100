@@ -55,6 +55,53 @@ func helperExt() {
 			return nil, nil
 		})
 	}
+	if caps["bump"] {
+		// Stateful counter; the state hooks below expose it so upgrade
+		// migration can be exercised.
+		counter := 0
+		ext.Handle("bump", 1, func(p json.RawMessage) (any, error) {
+			counter++
+			return map[string]int{"counter": counter}, nil
+		})
+		if os.Getenv("EXTSYS_TEST_STATE") == "1" {
+			rejected := map[string]bool{}
+			for _, k := range strings.Split(os.Getenv("EXTSYS_TEST_REJECT"), ",") {
+				if k != "" {
+					rejected[k] = true
+				}
+			}
+			ext.StateHooks(
+				func() map[string]json.RawMessage {
+					return map[string]json.RawMessage{
+						"counter": json.RawMessage(fmt.Sprintf("%d", counter)),
+						"legacy":  json.RawMessage(`"v1"`),
+					}
+				},
+				func(items map[string]json.RawMessage) (map[string]json.RawMessage, map[string]string) {
+					accepted := map[string]json.RawMessage{}
+					rej := map[string]string{}
+					for k, v := range items {
+						if rejected[k] {
+							rej[k] = "build cannot interpret state key " + k
+						} else {
+							accepted[k] = v
+						}
+					}
+					return accepted, rej
+				},
+				func(items map[string]json.RawMessage) error {
+					if raw, ok := items["counter"]; ok {
+						var n int
+						if err := json.Unmarshal(raw, &n); err != nil {
+							return err
+						}
+						counter = n
+					}
+					return nil
+				},
+			)
+		}
+	}
 	if err := ext.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

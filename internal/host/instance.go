@@ -37,6 +37,7 @@ type Instance struct {
 	mu      sync.Mutex
 	pending map[string]*pendingCall
 	alive   bool
+	retired bool // drained after an upgrade; late state is ignored
 
 	bye chan struct{} // closed when the extension sends bye
 }
@@ -45,10 +46,10 @@ type Instance struct {
 type EndReason string
 
 const (
-	EndExited     EndReason = "exited"      // process exited of its own accord
-	EndBye        EndReason = "bye"         // drained and sent bye
-	EndGraceKill  EndReason = "grace_kill"  // exceeded grace/drain boundary
-	EndHostClose  EndReason = "host_close"  // host shutdown interrupted the wait
+	EndExited    EndReason = "exited"     // process exited of its own accord
+	EndBye       EndReason = "bye"        // drained and sent bye
+	EndGraceKill EndReason = "grace_kill" // exceeded grace/drain boundary
+	EndHostClose EndReason = "host_close" // host shutdown interrupted the wait
 )
 
 func newSessionToken() string {
@@ -168,6 +169,12 @@ func (inst *Instance) serve(stdout io.Reader) {
 			}
 			continue
 		}
+		// A retired (superseded) instance must not be able to overwrite
+		// state the new version already accepted: drop its late state
+		// reports instead of routing them anywhere.
+		if msg.Type == protocol.TypeState && inst.isRetired() {
+			continue
+		}
 		inst.mu.Lock()
 		pc, ok := inst.pending[msg.ID]
 		if ok {
@@ -190,29 +197,23 @@ func (inst *Instance) failAll(err error) {
 	}
 }
 
-// call sends one task and waits for the reply or ctx timeout.
-func (inst *Instance) call(id, capability string, payload json.RawMessage, timeout time.Duration) (*protocol.Message, error) {
+// request sends one message and waits for the correlated reply (matched
+// by ID) or the timeout.
+func (inst *Instance) request(msg *protocol.Message, timeout time.Duration) (*protocol.Message, error) {
 	inst.mu.Lock()
 	if !inst.alive {
 		inst.mu.Unlock()
 		return nil, ErrCrashed
 	}
 	pc := &pendingCall{ch: make(chan *protocol.Message, 1)}
-	inst.pending[id] = pc
+	inst.pending[msg.ID] = pc
 	inst.mu.Unlock()
 
-	msg := &protocol.Message{
-		Type:    protocol.TypeTask,
-		Session: inst.session,
-		ID:      id,
-		Cap:     capability,
-		Payload: payload,
-	}
 	if err := protocol.Encode(inst.stdin, msg); err != nil {
 		inst.mu.Lock()
-		delete(inst.pending, id)
+		delete(inst.pending, msg.ID)
 		inst.mu.Unlock()
-		return nil, fmt.Errorf("send task: %w", err)
+		return nil, fmt.Errorf("send %s: %w", msg.Type, err)
 	}
 
 	select {
@@ -220,10 +221,98 @@ func (inst *Instance) call(id, capability string, payload json.RawMessage, timeo
 		return resp, nil
 	case <-time.After(timeout):
 		inst.mu.Lock()
-		delete(inst.pending, id)
+		delete(inst.pending, msg.ID)
 		inst.mu.Unlock()
-		return nil, fmt.Errorf("task timed out after %s", timeout)
+		return nil, fmt.Errorf("%s timed out after %s", msg.Type, timeout)
 	}
+}
+
+// call sends one task and waits for the reply or ctx timeout.
+func (inst *Instance) call(id, capability string, payload json.RawMessage, timeout time.Duration) (*protocol.Message, error) {
+	return inst.request(&protocol.Message{
+		Type:    protocol.TypeTask,
+		Session: inst.session,
+		ID:      id,
+		Cap:     capability,
+		Payload: payload,
+	}, timeout)
+}
+
+// snapshotState asks the extension for its current session state.
+func (inst *Instance) snapshotState(id string, timeout time.Duration) (map[string]json.RawMessage, error) {
+	resp, err := inst.request(&protocol.Message{
+		Type:    protocol.TypeStateSnapshot,
+		Session: inst.session,
+		ID:      id,
+	}, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Type == protocol.TypeError {
+		return nil, fmt.Errorf("%s: %s", inst.name, resp.Err)
+	}
+	var out protocol.StateItems
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		return nil, fmt.Errorf("decode state snapshot: %w", err)
+	}
+	return out.Items, nil
+}
+
+// checkState asks a candidate build which of the given state items it
+// can accept and which it cannot interpret.
+func (inst *Instance) checkState(id string, items map[string]json.RawMessage, timeout time.Duration) (*protocol.StateVerdict, error) {
+	payload, _ := json.Marshal(protocol.StateItems{Items: items})
+	resp, err := inst.request(&protocol.Message{
+		Type:    protocol.TypeStateCheck,
+		Session: inst.session,
+		ID:      id,
+		Payload: payload,
+	}, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Type == protocol.TypeError {
+		return nil, fmt.Errorf("%s: %s", inst.name, resp.Err)
+	}
+	var out protocol.StateVerdict
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		return nil, fmt.Errorf("decode state verdict: %w", err)
+	}
+	return &out, nil
+}
+
+// applyState hands accepted state items to the candidate build.
+func (inst *Instance) applyState(id string, items map[string]json.RawMessage, timeout time.Duration) error {
+	payload, _ := json.Marshal(protocol.StateItems{Items: items})
+	resp, err := inst.request(&protocol.Message{
+		Type:    protocol.TypeStateApply,
+		Session: inst.session,
+		ID:      id,
+		Payload: payload,
+	}, timeout)
+	if err != nil {
+		return err
+	}
+	if resp.Type == protocol.TypeError {
+		return fmt.Errorf("%s: %s", inst.name, resp.Err)
+	}
+	return nil
+}
+
+// markRetired flags the instance as superseded. State messages from a
+// retired instance are late results of the old session and must never
+// overwrite what the new version already accepted; serve drops them.
+func (inst *Instance) markRetired() {
+	inst.mu.Lock()
+	inst.retired = true
+	inst.mu.Unlock()
+}
+
+// isRetired reports whether the instance was superseded by an upgrade.
+func (inst *Instance) isRetired() bool {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	return inst.retired
 }
 
 // inFlight reports how many tasks have been dispatched but not answered.

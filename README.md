@@ -41,6 +41,29 @@ Upgrade 用一份候选清单替换同名扩展，期间严格区分两类进程
 版本、哪一代进程处理。切换审计（validate / prepared / cutover /
 drained / activated / abort / rollback）通过 Journal.SwitchRecords
 导出，演示程序会完整打印。
+
+## 会话状态迁移
+
+扩展可以通过 extsdk.StateHooks 暴露有状态会话：快照（当前状态项）、
+检查（候选版本能接受/无法解释哪些状态项）、应用（接收迁移来的状态项）。
+
+- PlanUpgrade 准备候选并完成**状态检查**后返回升级计划：预览逐会话
+  列出旧版本保存的每个状态项，标注候选版本接受或拒绝（附原因）。
+  存在不兼容项时，Commit 必须携带该会话的明确处置（migrate 丢弃
+  不兼容项 / cancel 取消整个升级），否则拒绝生效；自动路径 Upgrade
+  遇到不兼容项直接取消并保留旧版本。
+- 候选准备期间旧会话继续服务。Commit 生效前会阻断新派发、等待旧会话
+  在途任务完成并重新快照，准备期间已确认的状态变化不会遗失；切流后
+  旧会话被标记退役，其迟到的状态消息被丢弃，不会覆盖新版本已接受
+  的状态。
+- 审计区分状态检查（state_check）、用户确认（confirmed）、实际生效
+  （cutover/drained/activated）与失败保留旧版本（abort/rollback）。
+- 会话归属台账（SessionOwnership / SessionOwner）记录每个会话最终由
+  哪个版本负责，连续升级、候选进程退出、准备中途停止（宿主关闭会
+  取消未提交的计划）之后均可查询。
+- Rollback 回退到旧构建时同样做状态检查，返回 RollbackReport 说明
+  旧版本接受了哪些新状态；存在被拒绝项时 StateRestored=false ——
+  旧进程恢复运行不等于会话状态已经恢复。
 - cmd/host — 主程序演示；cmd/textkit、cmd/hashkit 为两个自带扩展。
 
 textkit 额外提供 sleep（慢任务，用于超时验证）和 panic（异常退出，

@@ -51,11 +51,13 @@ type Manager struct {
 	taskSeq   int
 	switchSeq int
 	closed    bool
-	stopCh    chan struct{}     // closed when host shutdown begins
-	retired   []*Instance       // old incarnations draining in flight
+	stopCh    chan struct{}      // closed when host shutdown begins
+	retired   []*Instance        // old incarnations draining in flight
+	ledger    []SessionOwnership // which version owns/owned each session
 
-	upgradeMu sync.Mutex // serialises overlapping upgrade attempts
-	upgrading sync.WaitGroup
+	upgradeMu    sync.Mutex // serialises overlapping upgrade attempts
+	upgrading    sync.WaitGroup
+	pendingPlans map[*UpgradePlan]struct{} // prepared, not yet resolved
 }
 
 // New validates manifests and resolves the dependency order. Any
@@ -63,10 +65,11 @@ type Manager struct {
 // runs.
 func New(manifests []Manifest, cfg Config) (*Manager, error) {
 	m := &Manager{
-		cfg:       cfg,
-		manifests: map[string]Manifest{},
-		instances: map[string]*Instance{},
-		providers: map[string]string{},
+		cfg:          cfg,
+		manifests:    map[string]Manifest{},
+		instances:    map[string]*Instance{},
+		providers:    map[string]string{},
+		pendingPlans: map[*UpgradePlan]struct{}{},
 	}
 	order, err := validateManifests(manifests, m.manifests)
 	if err != nil {
@@ -183,6 +186,7 @@ func (m *Manager) Start() error {
 		for _, c := range mf.Provides {
 			m.providers[c] = name
 		}
+		m.noteOwnershipLocked(name, inst, "active", "initial start")
 		started = append(started, name)
 	}
 	return nil
@@ -306,6 +310,7 @@ func (m *Manager) Restart(name string) error {
 				delete(m.providers, capName)
 			}
 		}
+		m.noteOwnershipLocked(name, old, "retired", "replaced by restart")
 		old.shutdown(m.cfg.ShutdownGrace)
 		delete(m.instances, name)
 	}
@@ -317,6 +322,7 @@ func (m *Manager) Restart(name string) error {
 	for _, c := range mf.Provides {
 		m.providers[c] = name
 	}
+	m.noteOwnershipLocked(name, inst, "active", "restart with fresh session")
 	return nil
 }
 
@@ -339,16 +345,27 @@ type stagedItem struct {
 // exits + new version fails to start" safe: a failure anywhere before
 // cutover tears down only the candidates, while the running versions
 // (including any that crashed independently) remain the task owners.
-func (m *Manager) Upgrade(candidates []Manifest) error {
+// PlanUpgrade prepares an upgrade without activating it: candidates
+// are spawned and verified, then every running session's state is
+// snapshotted and checked against the candidate build. The returned
+// plan's Checks describe, per session, which state items the candidate
+// accepts and which it cannot interpret; the caller then commits with
+// an explicit disposition or cancels. Old versions keep serving all
+// traffic until Commit.
+func (m *Manager) PlanUpgrade(candidates []Manifest) (*UpgradePlan, error) {
 	m.upgradeMu.Lock()
 	m.upgrading.Add(1)
-	defer m.upgrading.Done()
-	defer m.upgradeMu.Unlock()
+
+	fail := func(err error) (*UpgradePlan, error) {
+		m.upgrading.Done()
+		m.upgradeMu.Unlock()
+		return nil, err
+	}
 
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return fmt.Errorf("manager is shutting down")
+		return fail(fmt.Errorf("manager is shutting down"))
 	}
 	m.switchSeq++
 	upgradeID := fmt.Sprintf("upgrade-%d", m.switchSeq)
@@ -363,7 +380,7 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	}
 	for _, mf := range candidates {
 		if _, known := next[mf.Name]; !known {
-			return fmt.Errorf("upgrade unknown extension %q", mf.Name)
+			return fail(fmt.Errorf("upgrade unknown extension %q", mf.Name))
 		}
 		next[mf.Name] = mf
 	}
@@ -372,7 +389,7 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 		for _, mf := range candidates {
 			m.recordSwitch(SwitchAbort, upgradeID, mf.Name, nil, nil, err.Error())
 		}
-		return err
+		return fail(err)
 	}
 
 	// Snapshot current instances/providers for dependency checks and
@@ -422,12 +439,12 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 		inst, spawnErr := m.spawnCandidate(mf, stop)
 		if spawnErr != nil {
 			m.abortUpgrade(upgradeID, staged, prepared, spawnErr, stop)
-			return spawnErr
+			return fail(spawnErr)
 		}
 		if err := m.verifyInstance(mf, inst, candidateProviders); err != nil {
 			inst.shutdown(0)
 			m.abortUpgrade(upgradeID, staged, prepared, err, stop)
-			return err
+			return fail(err)
 		}
 		item.new = inst
 		prepared[name] = inst
@@ -435,39 +452,102 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 		m.recordSwitch(SwitchPrepared, upgradeID, name, old, inst, "handshake and capability checks passed")
 	}
 
-	// All candidates are valid. Cut over atomically: new tasks now go
-	// only to the new instances. Calls already in flight keep holding
-	// the old Instance pointer, so a task is never delivered twice.
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		closeErr := fmt.Errorf("host closed before cutover")
-		m.abortUpgrade(upgradeID, staged, prepared, closeErr, stop)
-		return closeErr
-	}
+	// State check: snapshot every running session and ask the
+	// candidate which items it can accept. The old sessions keep
+	// producing state changes during this phase; Commit re-snapshots
+	// so nothing confirmed in the meantime is lost.
+	var checks []SessionCheck
 	for i := range staged {
 		item := &staged[i]
-		if item.old != nil {
-			m.retired = append(m.retired, item.old)
+		if item.old == nil {
+			continue
 		}
-		m.instances[item.name] = item.new
-		m.manifests[item.name] = next[item.name]
-		m.recordSwitchLocked(SwitchCutover, upgradeID, item.name, item.old, item.new, "new tasks route to new version")
+		items, snapErr := item.old.snapshotState("state-check-"+upgradeID+"-"+item.name, m.cfg.TaskTimeout)
+		if snapErr != nil {
+			m.abortUpgrade(upgradeID, staged, prepared, snapErr, stop)
+			return fail(fmt.Errorf("state snapshot of %s: %w", item.name, snapErr))
+		}
+		verdict, checkErr := item.new.checkState("state-verdict-"+upgradeID+"-"+item.name, items, m.cfg.TaskTimeout)
+		if checkErr != nil {
+			m.abortUpgrade(upgradeID, staged, prepared, checkErr, stop)
+			return fail(fmt.Errorf("state check of %s: %w", item.name, checkErr))
+		}
+		check := SessionCheck{
+			Extension:  item.name,
+			Session:    item.old.session,
+			OldVersion: item.old.extVer,
+			NewVersion: item.new.extVer,
+			NewSession: item.new.session,
+		}
+		for k, v := range verdict.Accepted {
+			check.Items = append(check.Items, StateItemView{Key: k, Value: v, Accepted: true})
+		}
+		for k, reason := range verdict.Rejected {
+			check.Items = append(check.Items, StateItemView{Key: k, Value: items[k], Accepted: false, Reason: reason})
+		}
+		sort.Slice(check.Items, func(a, b int) bool { return check.Items[a].Key < check.Items[b].Key })
+		checks = append(checks, check)
+		m.recordSwitch(SwitchStateCheck, upgradeID, item.name, item.old, item.new,
+			fmt.Sprintf("%d item(s) accepted, %d not interpretable by candidate",
+				len(verdict.Accepted), len(verdict.Rejected)))
 	}
-	m.order = order
-	m.mu.Unlock()
 
-	// Drain old incarnations in reverse dependency order so providers
-	// outlive their dependents during the handoff. The drain ends for
-	// an explicit reason: clean bye/exit, the agreed grace boundary, or
-	// host shutdown.
+	plan := &UpgradePlan{
+		ID:       upgradeID,
+		m:        m,
+		stop:     stop,
+		staged:   staged,
+		prepared: prepared,
+		order:    order,
+		next:     next,
+		checks:   checks,
+	}
+	m.mu.Lock()
+	m.pendingPlans[plan] = struct{}{}
+	m.mu.Unlock()
+	return plan, nil
+}
+
+// Upgrade atomically replaces one or more extension builds. It is the
+// automatic form of PlanUpgrade + Commit: it proceeds only when every
+// session state item is accepted by the candidate. When any item is
+// not interpretable, the upgrade is cancelled and an error names the
+// affected sessions — the caller must use PlanUpgrade to review the
+// items and choose an explicit disposition.
+func (m *Manager) Upgrade(candidates []Manifest) error {
+	plan, err := m.PlanUpgrade(candidates)
+	if err != nil {
+		return err
+	}
+	decisions := map[string]SessionDecision{}
+	for _, c := range plan.Checks() {
+		if c.HasRejected() {
+			err := fmt.Errorf("session %s of %s has state items the candidate cannot interpret; "+
+				"automatic upgrade refused, use PlanUpgrade to choose a disposition", c.Session, c.Extension)
+			_ = plan.Cancel(err.Error())
+			return err
+		}
+		decisions[c.Session] = DecisionMigrate
+	}
+	return plan.Commit(decisions)
+}
+
+// drainAndActivate drains old incarnations in reverse dependency order
+// so providers outlive their dependents during the handoff, then
+// records activation. The drain ends for an explicit reason: clean
+// bye/exit, the agreed grace boundary, or host shutdown.
+func (m *Manager) drainAndActivate(upgradeID string, staged []stagedItem, order []string) {
+	byName := map[string]*stagedItem{}
+	for i := range staged {
+		byName[staged[i].name] = &staged[i]
+	}
 	for i := len(order) - 1; i >= 0; i-- {
 		item := byName[order[i]]
 		if item == nil || item.old == nil {
 			continue
 		}
 		old := item.old
-		reason := old.drain(m.cfg.ShutdownGrace, stop)
+		reason := old.drain(m.cfg.ShutdownGrace, m.stop())
 		switchDetail := string(reason)
 		event := SwitchDrained
 		switch {
@@ -487,7 +567,6 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 		item := &staged[i]
 		m.recordSwitch(SwitchActivated, upgradeID, item.name, item.old, item.new, "handoff complete")
 	}
-	return nil
 }
 
 // spawnCandidate spawns one candidate but aborts promptly with an
@@ -524,13 +603,68 @@ func (m *Manager) abortUpgrade(upgradeID string, staged []stagedItem, prepared m
 		item := &staged[i]
 		new := item.new
 		if new == nil {
+			if item.old != nil {
+				m.noteOwnership(item.name, item.old, "retained",
+					"candidate failed before preparation finished: "+cause.Error())
+			}
 			m.recordSwitch(SwitchAbort, upgradeID, item.name, item.old, nil, cause.Error())
 			continue
 		}
 		reason := new.drain(m.cfg.ShutdownGrace, stop)
+		if item.old != nil {
+			m.noteOwnership(item.name, item.old, "retained",
+				fmt.Sprintf("candidate rejected (%v) and removed; old version still responsible", cause))
+		}
 		m.recordSwitch(SwitchRollback, upgradeID, item.name, item.old, new,
 			fmt.Sprintf("candidate rejected (%v); removed (%s); old version retained", cause, reason))
 	}
+}
+
+// noteOwnershipLocked appends a session-ownership ledger entry. The
+// caller must hold m.mu.
+func (m *Manager) noteOwnershipLocked(name string, inst *Instance, status, detail string) {
+	m.ledger = append(m.ledger, SessionOwnership{
+		Time:      time.Now().UTC(),
+		Extension: name,
+		Session:   inst.session,
+		Version:   inst.extVer,
+		Status:    status,
+		Detail:    detail,
+	})
+}
+
+func (m *Manager) noteOwnership(name string, inst *Instance, status, detail string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.noteOwnershipLocked(name, inst, status, detail)
+}
+
+// SessionOwnership returns the ownership history of one extension's
+// sessions, oldest first: which version was responsible for each
+// session across starts, upgrades, failed candidates and aborts.
+func (m *Manager) SessionOwnership(name string) []SessionOwnership {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []SessionOwnership
+	for _, e := range m.ledger {
+		if e.Extension == name {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// SessionOwner reports which version and session is currently
+// responsible for the extension's state.
+func (m *Manager) SessionOwner(name string) (SessionOwnership, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := len(m.ledger) - 1; i >= 0; i-- {
+		if m.ledger[i].Extension == name && m.ledger[i].Status == "active" {
+			return m.ledger[i], true
+		}
+	}
+	return SessionOwnership{}, false
 }
 
 func removeInstance(list []*Instance, target *Instance) []*Instance {
@@ -589,7 +723,21 @@ func (m *Manager) Shutdown() {
 		return
 	}
 	m.closed = true
+	if m.stopCh != nil {
+		close(m.stopCh)
+	}
+	plans := make([]*UpgradePlan, 0, len(m.pendingPlans))
+	for p := range m.pendingPlans {
+		plans = append(plans, p)
+	}
 	m.mu.Unlock()
+
+	// A prepared-but-never-committed upgrade must not strand its
+	// candidates: cancel it so the audit trail records the abort and
+	// the old versions remain the session owners.
+	for _, p := range plans {
+		_ = p.Cancel("host closed during upgrade preparation")
+	}
 
 	for i := len(m.order) - 1; i >= 0; i-- {
 		name := m.order[i]

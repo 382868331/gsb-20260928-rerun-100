@@ -51,7 +51,7 @@ func main() {
 		{
 			Name:     "textkit",
 			Path:     filepath.Join(binDir, "textkit"),
-			Provides: []string{"uppercase", "wordcount", "sleep", "panic"},
+			Provides: []string{"uppercase", "wordcount", "sleep", "panic", "count"},
 			// textkit's hashupper pipeline depends on hashkit, so it
 			// must start after hashkit and only if sha256 is live.
 			Requires: []string{"sha256"},
@@ -94,11 +94,14 @@ func main() {
 	fmt.Println("[task] uppercase after restart ->",
 		mustJSON(mgr.Call("uppercase", map[string]string{"text": "back online"})))
 
-	// --- Dependency-ordered upgrade -------------------------------
+	// --- Dependency-ordered upgrade with state migration ------------
 	// Both extensions move to a new build (same trusted local binary,
-	// new version stamp). Old processes keep serving while candidates
-	// are spawned and verified; only after every candidate passes the
-	// handshake does traffic cut over.
+	// new version stamp). textkit 1.3.0 no longer understands the
+	// legacy_note state item, so the upgrade is prepared as a plan:
+	// the preview shows which state items the candidate accepts, and
+	// the user explicitly decides the fate of the incompatible item.
+	fmt.Println("[task] count  ->", mustJSON(mgr.Call("count", nil)))
+	fmt.Println("[task] count  ->", mustJSON(mgr.Call("count", nil)))
 	oldTextkit, oldHashkit := mgr.Session("textkit"), mgr.Session("hashkit")
 	fmt.Println("[task] uppercase before upgrade ->",
 		mustJSON(mgr.Call("uppercase", map[string]string{"text": "served by old build"})))
@@ -112,18 +115,62 @@ func main() {
 		{
 			Name:     "textkit",
 			Path:     filepath.Join(binDir, "textkit"),
-			Env:      []string{"TEXTKIT_VERSION=1.3.0"},
-			Provides: []string{"uppercase", "wordcount", "sleep", "panic"},
+			Env:      []string{"TEXTKIT_VERSION=1.3.0", "TEXTKIT_DROP_LEGACY=1"},
+			Provides: []string{"uppercase", "wordcount", "sleep", "panic", "count"},
 			Requires: []string{"sha256"},
 		},
 	}
-	if err := mgr.Upgrade(upgrade); err != nil {
-		log.Fatalf("upgrade failed, old combination must still serve: %v", err)
+	plan, err := mgr.PlanUpgrade(upgrade)
+	if err != nil {
+		log.Fatalf("upgrade preparation failed, old combination must still serve: %v", err)
+	}
+	fmt.Println("[host] upgrade preview (state migration check):")
+	decisions := map[string]host.SessionDecision{}
+	for _, check := range plan.Checks() {
+		fmt.Printf("  session %s... of %s: %s -> %s\n",
+			check.Session[:8], check.Extension, check.OldVersion, check.NewVersion)
+		for _, item := range check.Items {
+			if item.Accepted {
+				fmt.Printf("    [accept] %s = %s\n", item.Key, item.Value)
+			} else {
+				fmt.Printf("    [REJECT] %s = %s (%s)\n", item.Key, item.Value, item.Reason)
+			}
+		}
+		if check.HasRejected() {
+			// The user reviews the incompatible items and explicitly
+			// chooses to migrate (dropping them) instead of cancelling.
+			decisions[check.Session] = host.DecisionMigrate
+			fmt.Printf("    -> user decision for session %s...: migrate, drop rejected items\n",
+				check.Session[:8])
+		}
+	}
+	if err := plan.Commit(decisions); err != nil {
+		log.Fatalf("upgrade commit failed, old combination must still serve: %v", err)
 	}
 	fmt.Printf("[host] upgrade cut over: textkit %s... -> %s..., hashkit %s... -> %s...\n",
 		oldTextkit[:8], mgr.Session("textkit")[:8], oldHashkit[:8], mgr.Session("hashkit")[:8])
+	fmt.Println("[task] count after upgrade (state carried over) ->", mustJSON(mgr.Call("count", nil)))
 	fmt.Println("[task] uppercase after upgrade ->",
 		mustJSON(mgr.Call("uppercase", map[string]string{"text": "served by new build"})))
+
+	// --- Session ownership ------------------------------------------
+	fmt.Println("[host] session ownership ledger for textkit:")
+	for _, e := range mgr.SessionOwnership("textkit") {
+		fmt.Printf("  %-8s %s(%s) %s\n", e.Status, e.Version, short(e.Session), e.Detail)
+	}
+
+	// --- Rollback with an honest state report -----------------------
+	// Rolling back to 1.2.0 re-checks the current session state
+	// against the old build; the report states whether the state can
+	// be considered restored, not just whether the process runs.
+	previous := manifests[1]
+	rep, err := mgr.Rollback("textkit", previous)
+	if err != nil {
+		log.Fatalf("rollback failed: %v", err)
+	}
+	fmt.Printf("[host] rollback textkit %s -> %s: state_restored=%v (%s)\n",
+		rep.FromVersion, rep.ToVersion, rep.StateRestored, rep.Detail)
+	fmt.Println("[task] count after rollback ->", mustJSON(mgr.Call("count", nil)))
 
 	// --- Failed upgrade keeps the old combination -------------------
 	// This candidate declares a capability the binary does not
@@ -133,7 +180,7 @@ func main() {
 		Name:     "textkit",
 		Path:     filepath.Join(binDir, "textkit"),
 		Env:      []string{"TEXTKIT_VERSION=9.9.9"},
-		Provides: []string{"uppercase", "wordcount", "sleep", "panic", "fly"},
+		Provides: []string{"uppercase", "wordcount", "sleep", "panic", "count", "fly"},
 		Requires: []string{"sha256"},
 	}}
 	before := mgr.Session("textkit")

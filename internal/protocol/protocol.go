@@ -22,6 +22,17 @@ const (
 	TypeError    = "error"     // ext -> host: failure
 	TypeShutdown = "shutdown"  // host -> ext: stop accepting, drain, exit
 	TypeBye      = "bye"       // ext -> host: drained, about to exit
+
+	// Session-state migration messages. The host uses these while an
+	// upgrade candidate is being prepared: snapshot the running
+	// session's state, ask the candidate which items it can interpret,
+	// then apply the accepted items before cutover.
+	TypeStateSnapshot = "state_snapshot" // host -> ext: report current session state
+	TypeState         = "state"          // ext -> host: current state items
+	TypeStateCheck    = "state_check"    // host -> ext: which of these items can you accept?
+	TypeStateVerdict  = "state_verdict"  // ext -> host: accepted items + rejected keys with reasons
+	TypeStateApply    = "state_apply"    // host -> ext: adopt these state items
+	TypeStateApplied  = "state_applied"  // ext -> host: items adopted
 )
 
 // Capability is a named, versioned operation an extension can perform.
@@ -43,6 +54,21 @@ type Message struct {
 	Cap      string          `json:"capability,omitempty"`
 	Payload  json.RawMessage `json:"payload,omitempty"`
 	Err      string          `json:"error,omitempty"`
+}
+
+// StateItems carries a session's state as opaque key/value items. The
+// host never interprets the values; only the producing and consuming
+// extension builds know their meaning.
+type StateItems struct {
+	Items map[string]json.RawMessage `json:"items"`
+}
+
+// StateVerdict is a candidate build's answer to a state check: the
+// items it can accept unchanged, and the items it cannot interpret
+// with a human-readable reason per key.
+type StateVerdict struct {
+	Accepted map[string]json.RawMessage `json:"accepted"`
+	Rejected map[string]string          `json:"rejected"`
 }
 
 // Compatible reports whether a peer speaking protocol version v can
