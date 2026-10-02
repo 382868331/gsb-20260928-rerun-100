@@ -51,8 +51,11 @@ type Manager struct {
 	taskSeq   int
 	switchSeq int
 	closed    bool
-	stopCh    chan struct{}     // closed when host shutdown begins
-	retired   []*Instance       // old incarnations draining in flight
+	stopCh    chan struct{} // closed when host shutdown begins
+	retired   []*Instance   // old incarnations draining in flight
+
+	owners map[string]SessionOwnership // session token -> responsible version
+	plan   *UpgradePlan                // prepared upgrade awaiting confirmation
 
 	upgradeMu sync.Mutex // serialises overlapping upgrade attempts
 	upgrading sync.WaitGroup
@@ -67,6 +70,7 @@ func New(manifests []Manifest, cfg Config) (*Manager, error) {
 		manifests: map[string]Manifest{},
 		instances: map[string]*Instance{},
 		providers: map[string]string{},
+		owners:    map[string]SessionOwnership{},
 	}
 	order, err := validateManifests(manifests, m.manifests)
 	if err != nil {
@@ -184,6 +188,7 @@ func (m *Manager) Start() error {
 			m.providers[c] = name
 		}
 		started = append(started, name)
+		m.setOwner(inst.session, name, inst.extVer, true, "started")
 	}
 	return nil
 }
@@ -287,7 +292,7 @@ func (m *Manager) Alive(name string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	inst, ok := m.instances[name]
-	return ok && inst.alive
+	return ok && inst.isAlive()
 }
 
 // Restart replaces a dead extension process with a fresh one. The new
@@ -306,6 +311,7 @@ func (m *Manager) Restart(name string) error {
 				delete(m.providers, capName)
 			}
 		}
+		m.setOwnerLocked(old.session, name, old.extVer, false, "restarted")
 		old.shutdown(m.cfg.ShutdownGrace)
 		delete(m.instances, name)
 	}
@@ -317,6 +323,7 @@ func (m *Manager) Restart(name string) error {
 	for _, c := range mf.Provides {
 		m.providers[c] = name
 	}
+	m.setOwnerLocked(inst.session, name, inst.extVer, true, "restarted")
 	return nil
 }
 
@@ -325,6 +332,18 @@ type stagedItem struct {
 	name string
 	new  *Instance // nil until spawned
 	old  *Instance // nil when there was no running incarnation
+}
+
+// stagedUpgrade carries a prepared upgrade from the preparation phase
+// to the confirmation/cutover phase.
+type stagedUpgrade struct {
+	id       string
+	next     map[string]Manifest
+	order    []string
+	staged   []stagedItem
+	byName   map[string]*stagedItem
+	prepared map[string]*Instance
+	stop     <-chan struct{}
 }
 
 // Upgrade atomically replaces one or more extension builds. Candidates
@@ -344,11 +363,22 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	m.upgrading.Add(1)
 	defer m.upgrading.Done()
 	defer m.upgradeMu.Unlock()
+	su, err := m.prepareUpgrade(candidates)
+	if err != nil {
+		return err
+	}
+	m.finishUpgrade(su)
+	return nil
+}
 
+// prepareUpgrade validates the candidate set, then spawns and verifies
+// every candidate while the old combination keeps serving. The caller
+// must hold upgradeMu. Any failure tears down only the candidates.
+func (m *Manager) prepareUpgrade(candidates []Manifest) (*stagedUpgrade, error) {
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
-		return fmt.Errorf("manager is shutting down")
+		return nil, fmt.Errorf("manager is shutting down")
 	}
 	m.switchSeq++
 	upgradeID := fmt.Sprintf("upgrade-%d", m.switchSeq)
@@ -363,7 +393,7 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	}
 	for _, mf := range candidates {
 		if _, known := next[mf.Name]; !known {
-			return fmt.Errorf("upgrade unknown extension %q", mf.Name)
+			return nil, fmt.Errorf("upgrade unknown extension %q", mf.Name)
 		}
 		next[mf.Name] = mf
 	}
@@ -372,7 +402,7 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 		for _, mf := range candidates {
 			m.recordSwitch(SwitchAbort, upgradeID, mf.Name, nil, nil, err.Error())
 		}
-		return err
+		return nil, err
 	}
 
 	// Snapshot current instances/providers for dependency checks and
@@ -422,19 +452,39 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 		inst, spawnErr := m.spawnCandidate(mf, stop)
 		if spawnErr != nil {
 			m.abortUpgrade(upgradeID, staged, prepared, spawnErr, stop)
-			return spawnErr
+			return nil, spawnErr
 		}
 		if err := m.verifyInstance(mf, inst, candidateProviders); err != nil {
 			inst.shutdown(0)
 			m.abortUpgrade(upgradeID, staged, prepared, err, stop)
-			return err
+			return nil, err
 		}
 		item.new = inst
 		prepared[name] = inst
 		old := item.old
 		m.recordSwitch(SwitchPrepared, upgradeID, name, old, inst, "handshake and capability checks passed")
 	}
+	return &stagedUpgrade{
+		id:       upgradeID,
+		next:     next,
+		order:    order,
+		staged:   staged,
+		byName:   byName,
+		prepared: prepared,
+		stop:     stop,
+	}, nil
+}
 
+// finishUpgrade cuts traffic over to the prepared candidates, drains
+// the old incarnations in reverse dependency order, and only then
+// records activation. The caller must hold upgradeMu.
+func (m *Manager) finishUpgrade(su *stagedUpgrade) {
+	upgradeID := su.id
+	order := su.order
+	staged := su.staged
+	byName := su.byName
+	next := su.next
+	stop := su.stop
 	// All candidates are valid. Cut over atomically: new tasks now go
 	// only to the new instances. Calls already in flight keep holding
 	// the old Instance pointer, so a task is never delivered twice.
@@ -442,16 +492,18 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	if m.closed {
 		m.mu.Unlock()
 		closeErr := fmt.Errorf("host closed before cutover")
-		m.abortUpgrade(upgradeID, staged, prepared, closeErr, stop)
-		return closeErr
+		m.abortUpgrade(upgradeID, staged, su.prepared, closeErr, stop)
+		return
 	}
 	for i := range staged {
 		item := &staged[i]
 		if item.old != nil {
 			m.retired = append(m.retired, item.old)
+			m.setOwnerLocked(item.old.session, item.name, item.old.extVer, false, "superseded by "+upgradeID)
 		}
 		m.instances[item.name] = item.new
 		m.manifests[item.name] = next[item.name]
+		m.setOwnerLocked(item.new.session, item.name, item.new.extVer, true, "activated by "+upgradeID)
 		m.recordSwitchLocked(SwitchCutover, upgradeID, item.name, item.old, item.new, "new tasks route to new version")
 	}
 	m.order = order
@@ -487,7 +539,6 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 		item := &staged[i]
 		m.recordSwitch(SwitchActivated, upgradeID, item.name, item.old, item.new, "handoff complete")
 	}
-	return nil
 }
 
 // spawnCandidate spawns one candidate but aborts promptly with an
@@ -527,6 +578,7 @@ func (m *Manager) abortUpgrade(upgradeID string, staged []stagedItem, prepared m
 			m.recordSwitch(SwitchAbort, upgradeID, item.name, item.old, nil, cause.Error())
 			continue
 		}
+		m.setOwner(new.session, item.name, new.extVer, false, "candidate aborted: "+cause.Error())
 		reason := new.drain(m.cfg.ShutdownGrace, stop)
 		m.recordSwitch(SwitchRollback, upgradeID, item.name, item.old, new,
 			fmt.Sprintf("candidate rejected (%v); removed (%s); old version retained", cause, reason))
@@ -589,7 +641,20 @@ func (m *Manager) Shutdown() {
 		return
 	}
 	m.closed = true
+	if m.stopCh != nil {
+		close(m.stopCh)
+	}
+	plan := m.plan
+	m.plan = nil
 	m.mu.Unlock()
+
+	// A prepared-but-unconfirmed upgrade is stopped in the middle:
+	// only the candidates are torn down, the old combination stays
+	// responsible for its sessions until it drains below.
+	if plan != nil {
+		m.recordSwitch(SwitchAbort, plan.ID, "", nil, nil, "host closed with a prepared upgrade awaiting confirmation")
+		m.abortUpgrade(plan.su.id, plan.su.staged, plan.su.prepared, fmt.Errorf("host closed before confirmation"), plan.su.stop)
+	}
 
 	for i := len(m.order) - 1; i >= 0; i-- {
 		name := m.order[i]
@@ -597,6 +662,7 @@ func (m *Manager) Shutdown() {
 		inst := m.instances[name]
 		m.mu.Unlock()
 		if inst != nil {
+			m.setOwner(inst.session, name, inst.extVer, false, "host shutdown")
 			inst.shutdown(m.cfg.ShutdownGrace)
 		}
 	}

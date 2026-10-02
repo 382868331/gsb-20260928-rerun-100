@@ -24,13 +24,15 @@ type JournalEntry struct {
 // upgrade attempt. Every transition is persisted so a smooth handoff
 // (or its rollback) can be replayed after the fact.
 const (
-	SwitchValidate = "validate" // candidate set passed topology checks
-	SwitchPrepared = "prepared" // new instance passed handshake/cap checks
-	SwitchCutover  = "cutover"  // new tasks now route to the new instance
-	SwitchActivated = "activated" // old instance drained; new version live
-	SwitchAbort    = "abort"    // new instance rejected before cutover
-	SwitchRollback = "rollback" // candidate torn down, old version kept
-	SwitchDrained  = "drained"  // old process exited after handing work off
+	SwitchValidate    = "validate"     // candidate set passed topology checks
+	SwitchPrepared    = "prepared"     // new instance passed handshake/cap checks
+	SwitchStateCheck  = "state_check"  // old session state inspected, candidate compatibility known
+	SwitchConfirmed   = "confirmed"    // user confirmed the migration and its dispositions
+	SwitchCutover     = "cutover"      // new tasks now route to the new instance
+	SwitchActivated   = "activated"    // old instance drained; new version live
+	SwitchAbort       = "abort"        // new instance rejected before cutover
+	SwitchRollback    = "rollback"     // candidate torn down, old version kept
+	SwitchDrained     = "drained"      // old process exited after handing work off
 	SwitchDrainKilled = "drain_killed" // old process exceeded drain boundary
 	SwitchHostClose   = "host_close"   // wait ended because the host closed
 )

@@ -24,10 +24,32 @@ const (
 	TypeBye      = "bye"       // ext -> host: drained, about to exit
 )
 
+// State migration message types used during upgrades.
+const (
+	TypeStateQuery       = "state_query"        // host -> ext: dump your saved session state
+	TypeStateData        = "state_data"         // ext -> host: state snapshot (reply to state_query)
+	TypeStatePush        = "state_push"         // ext -> host: unsolicited state change notification
+	TypeStateCheck       = "state_check"        // host -> ext: which of these items can you interpret?
+	TypeStateCheckResult = "state_check_result" // ext -> host: accepted/rejected item keys
+	TypeStateLoad        = "state_load"         // host -> ext: adopt these state items
+	TypeStateLoaded      = "state_loaded"       // ext -> host: state adopted
+)
+
 // Capability is a named, versioned operation an extension can perform.
 type Capability struct {
 	Name    string `json:"name"`
 	Version int    `json:"version"`
+}
+
+// StateItem is one versioned key/value entry in an extension's saved
+// session state. Version is a per-session monotonic sequence assigned
+// by the extension that produced the value; a higher version always
+// wins during a merge, so a stale process can never overwrite a newer
+// value that another incarnation already accepted.
+type StateItem struct {
+	Key     string          `json:"key"`
+	Value   json.RawMessage `json:"value"`
+	Version uint64          `json:"version"`
 }
 
 // Message is the single envelope used in both directions. Fields are
@@ -43,6 +65,9 @@ type Message struct {
 	Cap      string          `json:"capability,omitempty"`
 	Payload  json.RawMessage `json:"payload,omitempty"`
 	Err      string          `json:"error,omitempty"`
+	Items    []StateItem     `json:"items,omitempty"`
+	Accepted []string        `json:"accepted,omitempty"`
+	Rejected []string        `json:"rejected,omitempty"`
 }
 
 // Compatible reports whether a peer speaking protocol version v can

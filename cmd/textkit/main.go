@@ -20,6 +20,14 @@ func main() {
 	}
 	ext := extsdk.New("textkit", version)
 
+	// State keys this build can interpret; the upgrade preview checks
+	// the old session's saved state against exactly this set.
+	stateKeys := os.Getenv("TEXTKIT_STATE_KEYS")
+	if stateKeys == "" {
+		stateKeys = "docs_processed,upper_calls"
+	}
+	ext.DeclareStateKeys(strings.Split(stateKeys, ",")...)
+
 	ext.Handle("uppercase", 1, func(p json.RawMessage) (any, error) {
 		var in struct {
 			Text string `json:"text"`
@@ -27,6 +35,11 @@ func main() {
 		if err := json.Unmarshal(p, &in); err != nil {
 			return nil, err
 		}
+		n := 0
+		if raw, ok := ext.State("upper_calls"); ok {
+			_ = json.Unmarshal(raw, &n)
+		}
+		_ = ext.SetState("upper_calls", n+1)
 		return map[string]string{"text": strings.ToUpper(in.Text)}, nil
 	})
 
@@ -37,6 +50,11 @@ func main() {
 		if err := json.Unmarshal(p, &in); err != nil {
 			return nil, err
 		}
+		n := 0
+		if raw, ok := ext.State("docs_processed"); ok {
+			_ = json.Unmarshal(raw, &n)
+		}
+		_ = ext.SetState("docs_processed", n+1)
 		return map[string]int{"words": len(strings.Fields(in.Text))}, nil
 	})
 

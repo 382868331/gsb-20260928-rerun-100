@@ -32,6 +32,35 @@ func helperExt() {
 		version = "3.1.4-test"
 	}
 	ext := extsdk.New(name, version)
+	var stateKeys []string
+	for _, k := range strings.Split(os.Getenv("EXTSYS_TEST_STATE_KEYS"), ",") {
+		if k != "" {
+			stateKeys = append(stateKeys, k)
+		}
+	}
+	ext.DeclareStateKeys(stateKeys...)
+	if caps["bump"] {
+		ext.Handle("bump", 1, func(p json.RawMessage) (any, error) {
+			var in struct {
+				Key   string `json:"key"`
+				Delta int    `json:"delta"`
+			}
+			if err := json.Unmarshal(p, &in); err != nil {
+				return nil, err
+			}
+			n := in.Delta
+			if raw, ok := ext.State(in.Key); ok {
+				var cur int
+				if err := json.Unmarshal(raw, &cur); err == nil {
+					n += cur
+				}
+			}
+			if err := ext.SetState(in.Key, n); err != nil {
+				return nil, err
+			}
+			return map[string]int{"value": n}, nil
+		})
+	}
 	if caps["echo"] {
 		ext.Handle("echo", 1, func(p json.RawMessage) (any, error) {
 			return map[string]json.RawMessage{"echoed": p}, nil

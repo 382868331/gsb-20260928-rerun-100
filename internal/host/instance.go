@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"sort"
 	"sync"
 	"time"
 
@@ -39,16 +40,20 @@ type Instance struct {
 	alive   bool
 
 	bye chan struct{} // closed when the extension sends bye
+
+	stateMu     sync.Mutex
+	pushedState map[string]protocol.StateItem // async pushes, merged by version
+	stateSink   func([]protocol.StateItem)    // set post-cutover to forward late pushes
 }
 
 // EndReason explains why a wait on an instance finished.
 type EndReason string
 
 const (
-	EndExited     EndReason = "exited"      // process exited of its own accord
-	EndBye        EndReason = "bye"         // drained and sent bye
-	EndGraceKill  EndReason = "grace_kill"  // exceeded grace/drain boundary
-	EndHostClose  EndReason = "host_close"  // host shutdown interrupted the wait
+	EndExited    EndReason = "exited"     // process exited of its own accord
+	EndBye       EndReason = "bye"        // drained and sent bye
+	EndGraceKill EndReason = "grace_kill" // exceeded grace/drain boundary
+	EndHostClose EndReason = "host_close" // host shutdown interrupted the wait
 )
 
 func newSessionToken() string {
@@ -79,13 +84,14 @@ func spawn(mf Manifest, handshakeTimeout time.Duration) (*Instance, error) {
 	}
 
 	inst := &Instance{
-		session: newSessionToken(),
-		cmd:     cmd,
-		stdin:   stdin,
-		done:    make(chan struct{}),
-		pending: map[string]*pendingCall{},
-		alive:   true,
-		bye:     make(chan struct{}),
+		session:     newSessionToken(),
+		cmd:         cmd,
+		stdin:       stdin,
+		done:        make(chan struct{}),
+		pending:     map[string]*pendingCall{},
+		alive:       true,
+		bye:         make(chan struct{}),
+		pushedState: map[string]protocol.StateItem{},
 	}
 
 	hello := &protocol.Message{
@@ -168,6 +174,10 @@ func (inst *Instance) serve(stdout io.Reader) {
 			}
 			continue
 		}
+		if msg.Type == protocol.TypeStatePush {
+			inst.noteStatePush(msg.Items)
+			continue
+		}
 		inst.mu.Lock()
 		pc, ok := inst.pending[msg.ID]
 		if ok {
@@ -178,6 +188,123 @@ func (inst *Instance) serve(stdout io.Reader) {
 			pc.ch <- &msg
 		}
 	}
+}
+
+// noteStatePush merges an unsolicited state update from the extension.
+// Only a strictly newer version of a key replaces what the host has
+// already seen, and any registered sink (a successor instance that has
+// taken over the session) is notified so confirmed changes are not
+// lost while a late duplicate can never roll state back.
+func (inst *Instance) noteStatePush(items []protocol.StateItem) {
+	inst.stateMu.Lock()
+	var fresh []protocol.StateItem
+	for _, item := range items {
+		if cur, ok := inst.pushedState[item.Key]; !ok || item.Version > cur.Version {
+			inst.pushedState[item.Key] = item
+			fresh = append(fresh, item)
+		}
+	}
+	sink := inst.stateSink
+	inst.stateMu.Unlock()
+	if sink != nil && len(fresh) > 0 {
+		sink(fresh)
+	}
+}
+
+// mergedState returns every state item the host knows about for this
+// instance, combining async pushes with the given extra items by version.
+func (inst *Instance) mergedState(extra []protocol.StateItem) []protocol.StateItem {
+	merged := map[string]protocol.StateItem{}
+	inst.stateMu.Lock()
+	for k, v := range inst.pushedState {
+		merged[k] = v
+	}
+	inst.stateMu.Unlock()
+	for _, item := range extra {
+		if cur, ok := merged[item.Key]; !ok || item.Version > cur.Version {
+			merged[item.Key] = item
+		}
+	}
+	out := make([]protocol.StateItem, 0, len(merged))
+	for _, item := range merged {
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// setStateSink installs the forwarder for late state pushes.
+func (inst *Instance) setStateSink(sink func([]protocol.StateItem)) {
+	inst.stateMu.Lock()
+	defer inst.stateMu.Unlock()
+	inst.stateSink = sink
+}
+
+// request sends one message and waits for its correlated reply.
+func (inst *Instance) request(msg *protocol.Message, timeout time.Duration) (*protocol.Message, error) {
+	inst.mu.Lock()
+	if !inst.alive {
+		inst.mu.Unlock()
+		return nil, ErrCrashed
+	}
+	pc := &pendingCall{ch: make(chan *protocol.Message, 1)}
+	inst.pending[msg.ID] = pc
+	inst.mu.Unlock()
+
+	msg.Session = inst.session
+	if err := protocol.Encode(inst.stdin, msg); err != nil {
+		inst.mu.Lock()
+		delete(inst.pending, msg.ID)
+		inst.mu.Unlock()
+		return nil, fmt.Errorf("send %s: %w", msg.Type, err)
+	}
+	select {
+	case resp := <-pc.ch:
+		return resp, nil
+	case <-time.After(timeout):
+		inst.mu.Lock()
+		delete(inst.pending, msg.ID)
+		inst.mu.Unlock()
+		return nil, fmt.Errorf("%s timed out after %s", msg.Type, timeout)
+	}
+}
+
+// queryState asks the extension for its saved session state and merges
+// the reply with any async pushes the host has already observed.
+func (inst *Instance) queryState(id string, timeout time.Duration) ([]protocol.StateItem, error) {
+	resp, err := inst.request(&protocol.Message{Type: protocol.TypeStateQuery, ID: id}, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Type != protocol.TypeStateData {
+		return nil, fmt.Errorf("expected state_data, got %q", resp.Type)
+	}
+	return inst.mergedState(resp.Items), nil
+}
+
+// checkState asks the extension which of the given state items it can
+// interpret. Returns (accepted, rejected) key lists.
+func (inst *Instance) checkState(id string, items []protocol.StateItem, timeout time.Duration) ([]string, []string, error) {
+	resp, err := inst.request(&protocol.Message{Type: protocol.TypeStateCheck, ID: id, Items: items}, timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+	if resp.Type != protocol.TypeStateCheckResult {
+		return nil, nil, fmt.Errorf("expected state_check_result, got %q", resp.Type)
+	}
+	return resp.Accepted, resp.Rejected, nil
+}
+
+// loadState hands state items to the extension for adoption.
+func (inst *Instance) loadState(id string, items []protocol.StateItem, timeout time.Duration) error {
+	resp, err := inst.request(&protocol.Message{Type: protocol.TypeStateLoad, ID: id, Items: items}, timeout)
+	if err != nil {
+		return err
+	}
+	if resp.Type != protocol.TypeStateLoaded {
+		return fmt.Errorf("expected state_loaded, got %q", resp.Type)
+	}
+	return nil
 }
 
 func (inst *Instance) failAll(err error) {
@@ -192,38 +319,19 @@ func (inst *Instance) failAll(err error) {
 
 // call sends one task and waits for the reply or ctx timeout.
 func (inst *Instance) call(id, capability string, payload json.RawMessage, timeout time.Duration) (*protocol.Message, error) {
-	inst.mu.Lock()
-	if !inst.alive {
-		inst.mu.Unlock()
-		return nil, ErrCrashed
-	}
-	pc := &pendingCall{ch: make(chan *protocol.Message, 1)}
-	inst.pending[id] = pc
-	inst.mu.Unlock()
-
-	msg := &protocol.Message{
+	return inst.request(&protocol.Message{
 		Type:    protocol.TypeTask,
-		Session: inst.session,
 		ID:      id,
 		Cap:     capability,
 		Payload: payload,
-	}
-	if err := protocol.Encode(inst.stdin, msg); err != nil {
-		inst.mu.Lock()
-		delete(inst.pending, id)
-		inst.mu.Unlock()
-		return nil, fmt.Errorf("send task: %w", err)
-	}
+	}, timeout)
+}
 
-	select {
-	case resp := <-pc.ch:
-		return resp, nil
-	case <-time.After(timeout):
-		inst.mu.Lock()
-		delete(inst.pending, id)
-		inst.mu.Unlock()
-		return nil, fmt.Errorf("task timed out after %s", timeout)
-	}
+// isAlive reports whether the process is still running.
+func (inst *Instance) isAlive() bool {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	return inst.alive
 }
 
 // inFlight reports how many tasks have been dispatched but not answered.
