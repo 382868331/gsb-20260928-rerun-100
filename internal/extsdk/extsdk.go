@@ -32,6 +32,19 @@ type Extension struct {
 	stateSeq   uint64
 	knownState map[string]bool
 	session    string
+
+	subMu sync.Mutex
+	subs  map[string]*subscription
+}
+
+// subscription is one declared event stream. NextID is the ID the next
+// emitted event will carry; the host moves it via sub_load when another
+// incarnation takes over, so the stream resumes exactly after the last
+// externally confirmed event instead of replaying it.
+type subscription struct {
+	name   string
+	nextID uint64
+	active bool
 }
 
 // New creates an extension with the given name and semantic version.
@@ -42,6 +55,7 @@ func New(name, version string) *Extension {
 		caps:       map[string]capability{},
 		state:      map[string]protocol.StateItem{},
 		knownState: map[string]bool{},
+		subs:       map[string]*subscription{},
 	}
 }
 
@@ -58,6 +72,53 @@ func (e *Extension) DeclareStateKeys(keys ...string) {
 	for _, k := range keys {
 		e.knownState[k] = true
 	}
+}
+
+// DeclareSubscriptions registers the persistent subscriptions this
+// build can produce and resume. During an upgrade the host only hands
+// a subscription to a candidate that declared it; anything else shows
+// up in the preview as not resumable and forces an explicit decision.
+func (e *Extension) DeclareSubscriptions(names ...string) {
+	e.subMu.Lock()
+	defer e.subMu.Unlock()
+	for _, n := range names {
+		if _, ok := e.subs[n]; !ok {
+			e.subs[n] = &subscription{name: n, nextID: 1, active: true}
+		}
+	}
+}
+
+// Emit assigns the next event ID for the subscription and delivers the
+// event to the host. It fails when the subscription is undeclared or
+// has been stopped (by a user decision during an upgrade).
+func (e *Extension) Emit(sub string, payload any) (uint64, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return 0, err
+	}
+	e.subMu.Lock()
+	s, ok := e.subs[sub]
+	if !ok {
+		e.subMu.Unlock()
+		return 0, fmt.Errorf("undeclared subscription %q", sub)
+	}
+	if !s.active {
+		e.subMu.Unlock()
+		return 0, fmt.Errorf("subscription %q is stopped", sub)
+	}
+	id := s.nextID
+	s.nextID++
+	e.subMu.Unlock()
+	session := e.session
+	if session == "" {
+		return id, nil
+	}
+	err = e.send(&protocol.Message{
+		Type:    protocol.TypeSubEvent,
+		Session: session,
+		Events:  []protocol.SubEvent{{Sub: sub, ID: id, Payload: raw}},
+	})
+	return id, err
 }
 
 // SetState records one state item and notifies the host. Each update
@@ -127,6 +188,11 @@ func (e *Extension) Run() error {
 	for name, c := range e.caps {
 		ack.Caps = append(ack.Caps, protocol.Capability{Name: name, Version: c.version})
 	}
+	e.subMu.Lock()
+	for name := range e.subs {
+		ack.SubNames = append(ack.SubNames, name)
+	}
+	e.subMu.Unlock()
 	if err := protocol.Encode(os.Stdout, ack); err != nil {
 		return fmt.Errorf("write hello_ack: %w", err)
 	}
@@ -193,6 +259,52 @@ func (e *Extension) Run() error {
 				Type:    protocol.TypeStateLoaded,
 				Session: session,
 				ID:      msg.ID,
+			})
+		case protocol.TypeSubQuery:
+			e.subMu.Lock()
+			progress := make([]protocol.SubProgress, 0, len(e.subs))
+			for _, s := range e.subs {
+				if s.active {
+					progress = append(progress, protocol.SubProgress{Sub: s.name, NextID: s.nextID})
+				}
+			}
+			e.subMu.Unlock()
+			_ = e.send(&protocol.Message{
+				Type:    protocol.TypeSubProgress,
+				Session: session,
+				ID:      msg.ID,
+				Subs:    progress,
+			})
+		case protocol.TypeSubLoad:
+			// Adopt the resume positions the host computed from its
+			// authoritative ledger: re-emitting starts right after the
+			// last externally confirmed event, so unconfirmed events are
+			// delivered again (and deduplicated host-side) instead of
+			// being silently treated as processed.
+			e.subMu.Lock()
+			for _, p := range msg.Subs {
+				if s, ok := e.subs[p.Sub]; ok {
+					s.nextID = p.NextID
+					s.active = true
+				}
+			}
+			e.subMu.Unlock()
+			_ = e.send(&protocol.Message{
+				Type:    protocol.TypeSubLoaded,
+				Session: session,
+				ID:      msg.ID,
+			})
+		case protocol.TypeSubStop:
+			e.subMu.Lock()
+			if s, ok := e.subs[msg.Name]; ok {
+				s.active = false
+			}
+			e.subMu.Unlock()
+			_ = e.send(&protocol.Message{
+				Type:    protocol.TypeSubStopped,
+				Session: session,
+				ID:      msg.ID,
+				Name:    msg.Name,
 			})
 		}
 	}

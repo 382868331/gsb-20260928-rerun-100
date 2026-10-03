@@ -28,6 +28,38 @@ func main() {
 	}
 	ext.DeclareStateKeys(strings.Split(stateKeys, ",")...)
 
+	// ticks is a persistent subscription: a continuous stream of
+	// identified events used to demonstrate subscription handoff
+	// during upgrades and rollbacks.
+	ext.DeclareSubscriptions("ticks")
+	ext.Handle("emit", 1, func(p json.RawMessage) (any, error) {
+		var in struct {
+			Sub         string `json:"sub"`
+			Count       int    `json:"count"`
+			DelayMillis int    `json:"delay_millis"`
+		}
+		if err := json.Unmarshal(p, &in); err != nil {
+			return nil, err
+		}
+		if in.Sub == "" {
+			in.Sub = "ticks"
+		}
+		if in.Count <= 0 {
+			in.Count = 1
+		}
+		go func() {
+			for i := 0; i < in.Count; i++ {
+				if in.DelayMillis > 0 {
+					time.Sleep(time.Duration(in.DelayMillis) * time.Millisecond)
+				}
+				if _, err := ext.Emit(in.Sub, map[string]string{"source": "textkit"}); err != nil {
+					return
+				}
+			}
+		}()
+		return map[string]string{"ok": "emitting"}, nil
+	})
+
 	ext.Handle("uppercase", 1, func(p json.RawMessage) (any, error) {
 		var in struct {
 			Text string `json:"text"`

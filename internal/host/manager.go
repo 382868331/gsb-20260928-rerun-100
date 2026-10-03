@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +56,7 @@ type Manager struct {
 	retired   []*Instance   // old incarnations draining in flight
 
 	owners map[string]SessionOwnership // session token -> responsible version
+	subs   map[string]*subscription    // ext/sub -> authoritative event ledger
 	plan   *UpgradePlan                // prepared upgrade awaiting confirmation
 
 	upgradeMu sync.Mutex // serialises overlapping upgrade attempts
@@ -71,6 +73,7 @@ func New(manifests []Manifest, cfg Config) (*Manager, error) {
 		instances: map[string]*Instance{},
 		providers: map[string]string{},
 		owners:    map[string]SessionOwnership{},
+		subs:      map[string]*subscription{},
 	}
 	order, err := validateManifests(manifests, m.manifests)
 	if err != nil {
@@ -183,6 +186,7 @@ func (m *Manager) Start() error {
 			m.rollback(started)
 			return err
 		}
+		inst.onSubEvent = m.handleSubEvents
 		m.instances[name] = inst
 		for _, c := range mf.Provides {
 			m.providers[c] = name
@@ -319,11 +323,28 @@ func (m *Manager) Restart(name string) error {
 	if err != nil {
 		return err
 	}
+	inst.onSubEvent = m.handleSubEvents
 	m.instances[name] = inst
 	for _, c := range mf.Provides {
 		m.providers[c] = name
 	}
 	m.setOwnerLocked(inst.session, name, inst.extVer, true, "restarted")
+	var resume []protocol.SubProgress
+	for _, s := range m.subs {
+		if s.extension == name && s.active && inst.subs[s.name] {
+			resume = append(resume, protocol.SubProgress{Sub: s.name, NextID: s.ackedUpTo + 1})
+		}
+	}
+	m.mu.Unlock()
+	// Resynchronise the subscription stream with the fresh process: it
+	// restarts its ID counter at 1, so without this it would replay
+	// events the host already confirmed.
+	if len(resume) > 0 {
+		if err := inst.loadSubs(m.nextReqID(), resume, m.cfg.TaskTimeout); err != nil {
+			return fmt.Errorf("resume subscriptions after restart of %s: %w", name, err)
+		}
+	}
+	m.mu.Lock()
 	return nil
 }
 
@@ -367,8 +388,7 @@ func (m *Manager) Upgrade(candidates []Manifest) error {
 	if err != nil {
 		return err
 	}
-	m.finishUpgrade(su)
-	return nil
+	return m.finishUpgrade(su, true)
 }
 
 // prepareUpgrade validates the candidate set, then spawns and verifies
@@ -454,6 +474,7 @@ func (m *Manager) prepareUpgrade(candidates []Manifest) (*stagedUpgrade, error) 
 			m.abortUpgrade(upgradeID, staged, prepared, spawnErr, stop)
 			return nil, spawnErr
 		}
+		inst.onSubEvent = m.handleSubEvents
 		if err := m.verifyInstance(mf, inst, candidateProviders); err != nil {
 			inst.shutdown(0)
 			m.abortUpgrade(upgradeID, staged, prepared, err, stop)
@@ -478,7 +499,15 @@ func (m *Manager) prepareUpgrade(candidates []Manifest) (*stagedUpgrade, error) 
 // finishUpgrade cuts traffic over to the prepared candidates, drains
 // the old incarnations in reverse dependency order, and only then
 // records activation. The caller must hold upgradeMu.
-func (m *Manager) finishUpgrade(su *stagedUpgrade) {
+//
+// When autoSubs is set (the non-interactive Upgrade path), every
+// active subscription of an affected extension is handed to the
+// candidate automatically — but only when the handoff is provably
+// safe: no unconfirmed events, no emitted-but-unseen gaps, and the
+// candidate declared the subscription. Anything uncertain aborts the
+// upgrade and points the user at the interactive PrepareUpgrade flow;
+// the automatic path never silently decides over uncertain progress.
+func (m *Manager) finishUpgrade(su *stagedUpgrade, autoSubs bool) error {
 	upgradeID := su.id
 	order := su.order
 	staged := su.staged
@@ -488,12 +517,32 @@ func (m *Manager) finishUpgrade(su *stagedUpgrade) {
 	// All candidates are valid. Cut over atomically: new tasks now go
 	// only to the new instances. Calls already in flight keep holding
 	// the old Instance pointer, so a task is never delivered twice.
+	if autoSubs {
+		for i := range staged {
+			item := &staged[i]
+			if item.old == nil || item.new == nil {
+				continue
+			}
+			progress, err := item.old.querySubs(m.nextReqID(), m.cfg.TaskTimeout)
+			if err != nil {
+				m.abortUpgrade(upgradeID, staged, su.prepared, err, stop)
+				return fmt.Errorf("read %s subscription progress: %w", item.name, err)
+			}
+			if problems := m.subUncertainty(item, progress); len(problems) > 0 {
+				err := fmt.Errorf("upgrade of %s needs an explicit subscription decision (%s); use PrepareUpgrade/ConfirmUpgrade",
+					item.name, strings.Join(problems, "; "))
+				m.recordSwitch(SwitchAbort, upgradeID, item.name, item.old, item.new, err.Error())
+				m.abortUpgrade(upgradeID, staged, su.prepared, err, stop)
+				return err
+			}
+		}
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		closeErr := fmt.Errorf("host closed before cutover")
 		m.abortUpgrade(upgradeID, staged, su.prepared, closeErr, stop)
-		return
+		return closeErr
 	}
 	for i := range staged {
 		item := &staged[i]
@@ -539,6 +588,21 @@ func (m *Manager) finishUpgrade(su *stagedUpgrade) {
 		item := &staged[i]
 		m.recordSwitch(SwitchActivated, upgradeID, item.name, item.old, item.new, "handoff complete")
 	}
+	if autoSubs {
+		// Fully confirmed and resumable subscriptions resume on the new
+		// build right after the last confirmed event.
+		for i := range staged {
+			item := &staged[i]
+			if item.old == nil || item.new == nil {
+				continue
+			}
+			handoff := m.planSubHandoff(item, nil)
+			if err := m.applySubHandoff(item, handoff); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // spawnCandidate spawns one candidate but aborts promptly with an

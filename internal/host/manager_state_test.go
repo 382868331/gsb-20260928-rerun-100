@@ -71,7 +71,7 @@ func TestUpgradeStatePreviewAndConfirm(t *testing.T) {
 	}
 
 	// Incompatible items demand an explicit decision.
-	if err := mgr.ConfirmUpgrade(plan.ID, nil); err == nil {
+	if err := mgr.ConfirmUpgrade(plan.ID, ConfirmDecisions{}); err == nil {
 		t.Fatal("confirm without a decision for incompatible items must fail")
 	}
 	// The failed attempt must not have activated anything.
@@ -79,7 +79,7 @@ func TestUpgradeStatePreviewAndConfirm(t *testing.T) {
 		t.Fatal("plan must still be open after a rejected confirmation")
 	}
 
-	if err := mgr.ConfirmUpgrade(plan.ID, map[string]Disposition{"a": DecideMigrate}); err != nil {
+	if err := mgr.ConfirmUpgrade(plan.ID, ConfirmDecisions{State: map[string]Disposition{"a": DecideMigrate}}); err != nil {
 		t.Fatalf("ConfirmUpgrade: %v", err)
 	}
 	newSession := mgr.Session("a")
@@ -142,7 +142,7 @@ func TestUpgradeStateChangesDuringPreparationSurvive(t *testing.T) {
 	bump(t, mgr, "counter", 10)
 	bump(t, mgr, "counter", 100)
 
-	if err := mgr.ConfirmUpgrade(plan.ID, nil); err != nil {
+	if err := mgr.ConfirmUpgrade(plan.ID, ConfirmDecisions{}); err != nil {
 		t.Fatalf("ConfirmUpgrade: %v", err)
 	}
 	items, err := mgr.DumpState("a")
@@ -202,7 +202,7 @@ func TestUpgradeDiscardDropsSessionState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareUpgrade: %v", err)
 	}
-	if err := mgr.ConfirmUpgrade(plan.ID, map[string]Disposition{"a": DecideDiscard}); err != nil {
+	if err := mgr.ConfirmUpgrade(plan.ID, ConfirmDecisions{State: map[string]Disposition{"a": DecideDiscard}}); err != nil {
 		t.Fatalf("ConfirmUpgrade: %v", err)
 	}
 	items, err := mgr.DumpState("a")
@@ -225,7 +225,7 @@ func TestRollbackReportsStateTheOldBuildCannotReceive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareUpgrade: %v", err)
 	}
-	if err := mgr.ConfirmUpgrade(plan.ID, nil); err != nil {
+	if err := mgr.ConfirmUpgrade(plan.ID, ConfirmDecisions{}); err != nil {
 		t.Fatalf("ConfirmUpgrade: %v", err)
 	}
 	bump(t, mgr, "counter", 10)
@@ -288,7 +288,7 @@ func TestSessionOwnershipAcrossFailureAndConsecutiveUpgrades(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareUpgrade: %v", err)
 	}
-	if err := mgr.ConfirmUpgrade(plan2.ID, nil); err != nil {
+	if err := mgr.ConfirmUpgrade(plan2.ID, ConfirmDecisions{}); err != nil {
 		t.Fatalf("ConfirmUpgrade: %v", err)
 	}
 	second := mgr.Session("a")
@@ -296,7 +296,7 @@ func TestSessionOwnershipAcrossFailureAndConsecutiveUpgrades(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareUpgrade: %v", err)
 	}
-	if err := mgr.ConfirmUpgrade(plan3.ID, nil); err != nil {
+	if err := mgr.ConfirmUpgrade(plan3.ID, ConfirmDecisions{}); err != nil {
 		t.Fatalf("ConfirmUpgrade: %v", err)
 	}
 	third := mgr.Session("a")
@@ -339,7 +339,7 @@ func TestShutdownDuringPreparedUpgradeAbortsPlan(t *testing.T) {
 	}
 	mgr.Shutdown()
 
-	if err := mgr.ConfirmUpgrade(plan.ID, nil); err == nil {
+	if err := mgr.ConfirmUpgrade(plan.ID, ConfirmDecisions{}); err == nil {
 		t.Fatal("confirm after shutdown must fail")
 	}
 	// The old session is retired by the shutdown itself, not by the

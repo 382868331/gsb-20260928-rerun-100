@@ -42,7 +42,9 @@ func (m *Manager) setOwnerLocked(session, ext, ver string, active bool, note str
 }
 
 // Disposition is the user's decision for one session whose saved state
-// contains items the candidate cannot interpret.
+// contains items the candidate cannot interpret, or for one
+// subscription whose processing progress cannot be handed over
+// automatically.
 type Disposition string
 
 const (
@@ -54,7 +56,22 @@ const (
 	// DecideCancel aborts the whole upgrade; the old version keeps
 	// serving and keeps its state.
 	DecideCancel Disposition = "cancel"
+	// DecideKeepOld aborts the whole upgrade because a subscription's
+	// progress is uncertain: the old version keeps serving and keeps
+	// the subscription.
+	DecideKeepOld Disposition = "keep_old"
+	// DecideStopSub stops the subscription on the old version and lets
+	// the upgrade proceed without migrating it.
+	DecideStopSub Disposition = "stop_sub"
 )
+
+// ConfirmDecisions carries the user's explicit decisions for a
+// prepared upgrade: per-extension state dispositions and per-
+// subscription dispositions (keyed "extension/subscription").
+type ConfirmDecisions struct {
+	State map[string]Disposition
+	Subs  map[string]Disposition
+}
 
 // SessionStatePreview describes, for one extension, the state the old
 // session has saved and how the candidate build reacts to it.
@@ -67,6 +84,10 @@ type SessionStatePreview struct {
 	Items      []protocol.StateItem // state saved by the old session
 	Accepted   []string             // keys the candidate can interpret
 	Rejected   []string             // keys the candidate cannot interpret
+	// Subs reports every active subscription of the old session: its
+	// scope, per-event progress, and whether the candidate can take
+	// it over. Anything uncertain demands an explicit user decision.
+	Subs []SubscriptionPreview
 }
 
 // UpgradePlan is a prepared upgrade awaiting user confirmation. While
@@ -130,6 +151,22 @@ func (m *Manager) PrepareUpgrade(candidates []Manifest) (*UpgradePlan, error) {
 		m.recordSwitch(SwitchStateCheck, su.id, item.name, item.old, item.new,
 			fmt.Sprintf("old session holds %d state items; candidate accepts %d, rejects %d",
 				len(items), len(accepted), len(rejected)))
+
+		// Subscription progress: what the old session is streaming, how
+		// far each event got, and whether the candidate can take over.
+		progress, err := item.old.querySubs(m.nextReqID(), m.cfg.TaskTimeout)
+		if err != nil {
+			m.abortUpgrade(su.id, su.staged, su.prepared, err, su.stop)
+			m.upgrading.Done()
+			m.upgradeMu.Unlock()
+			return nil, fmt.Errorf("dump %s subscription progress: %w", item.name, err)
+		}
+		preview.Subs = m.subPreviews(item, progress)
+		for _, sp := range preview.Subs {
+			m.recordSwitch(SwitchSubCheck, su.id, item.name, item.old, item.new,
+				fmt.Sprintf("subscription %s: next=%d acked=%d pending=%v uncertain=%v resumable=%v",
+					sp.Name, sp.NextID, sp.AckedUpTo, sp.Pending, sp.Uncertain, sp.CanResume))
+		}
 		plan.Sessions = append(plan.Sessions, preview)
 	}
 	m.mu.Lock()
@@ -161,7 +198,7 @@ func (m *Manager) takePlan(id string) *UpgradePlan {
 // the state, late pushes from the old process are only forwarded when
 // they carry a strictly newer version, so a stale result can never
 // overwrite what the new version already accepted.
-func (m *Manager) ConfirmUpgrade(planID string, decisions map[string]Disposition) error {
+func (m *Manager) ConfirmUpgrade(planID string, decisions ConfirmDecisions) error {
 	m.mu.Lock()
 	plan := m.plan
 	m.mu.Unlock()
@@ -169,23 +206,43 @@ func (m *Manager) ConfirmUpgrade(planID string, decisions map[string]Disposition
 		return fmt.Errorf("no prepared upgrade %q awaiting confirmation", planID)
 	}
 
-	// Every session with incompatible items needs an explicit decision.
-	// A missing decision leaves the plan (and the upgrade lock) open so
-	// the user can still decide; only a closing path releases them.
+	// Every session with incompatible items, and every subscription
+	// with uncertain progress, needs an explicit decision. A missing
+	// decision leaves the plan (and the upgrade lock) open so the user
+	// can still decide; only a closing path releases them.
+	cancel := func(reason string) error {
+		m.recordSwitch(SwitchConfirmed, plan.ID, "", nil, nil, reason)
+		m.abortUpgrade(plan.su.id, plan.su.staged, plan.su.prepared,
+			fmt.Errorf("%s", reason), plan.su.stop)
+		m.takePlan(planID)
+		m.upgrading.Done()
+		m.upgradeMu.Unlock()
+		return fmt.Errorf("upgrade %s %s", planID, reason)
+	}
 	for _, s := range plan.Sessions {
-		d := decisions[s.Extension]
+		d := decisions.State[s.Extension]
 		if d == DecideCancel {
-			m.recordSwitch(SwitchConfirmed, plan.ID, s.Extension, nil, nil, "user cancelled the upgrade")
-			m.abortUpgrade(plan.su.id, plan.su.staged, plan.su.prepared,
-				fmt.Errorf("cancelled by user"), plan.su.stop)
-			m.takePlan(planID)
-			m.upgrading.Done()
-			m.upgradeMu.Unlock()
-			return fmt.Errorf("upgrade %s cancelled by user", planID)
+			return cancel("cancelled by user")
 		}
 		if len(s.Rejected) > 0 && d != DecideMigrate && d != DecideDiscard {
 			return fmt.Errorf("session %s (%s) has %d incompatible state items; explicit decision required",
 				s.Extension, s.OldSession, len(s.Rejected))
+		}
+		for _, sp := range s.Subs {
+			if !sp.NeedsDecision() {
+				continue
+			}
+			sd := decisions.Subs[subKey(s.Extension, sp.Name)]
+			switch sd {
+			case DecideKeepOld:
+				return cancel(fmt.Sprintf("kept old version: subscription %s progress is uncertain",
+					subKey(s.Extension, sp.Name)))
+			case DecideStopSub:
+				// explicit: the subscription ends with the old version
+			default:
+				return fmt.Errorf("subscription %s has uncertain progress (pending=%v uncertain=%v resumable=%v); explicit decision required",
+					subKey(s.Extension, sp.Name), sp.Pending, sp.Uncertain, sp.CanResume)
+			}
 		}
 	}
 
@@ -205,7 +262,7 @@ func (m *Manager) ConfirmUpgrade(planID string, decisions map[string]Disposition
 		if item.old == nil || item.new == nil {
 			continue
 		}
-		decision := decisions[item.name]
+		decision := decisions.State[item.name]
 		if decision == "" {
 			decision = DecideMigrate // fully compatible: nothing to decide
 		}
@@ -220,9 +277,33 @@ func (m *Manager) ConfirmUpgrade(planID string, decisions map[string]Disposition
 		}
 		m.recordSwitch(SwitchConfirmed, plan.ID, item.name, item.old, item.new,
 			fmt.Sprintf("user decision %q; %d state items handed to the new version", decision, migrated))
+		if err := m.transferSubs(item, decisions.Subs, plan.ID); err != nil {
+			m.abortUpgrade(plan.su.id, plan.su.staged, plan.su.prepared, err, plan.su.stop)
+			return err
+		}
 	}
-	m.finishUpgrade(plan.su)
-	return nil
+	return m.finishUpgrade(plan.su, false)
+}
+
+// transferSubs applies the subscription decisions for one staged
+// extension at confirmation time. Progress is re-read from the live
+// ledger (events kept flowing while the plan was open): a subscription
+// the user chose to stop is stopped on the old version; a resumable
+// one is loaded into the candidate at exactly last-confirmed+1, so
+// unconfirmed events are re-emitted and confirmed under the new
+// version's ownership instead of being copied over as if processed.
+func (m *Manager) transferSubs(item *stagedItem, decisions map[string]Disposition, upgradeID string) error {
+	handoff := m.planSubHandoff(item, decisions)
+	for _, name := range handoff.stops {
+		m.recordSwitch(SwitchSubCheck, upgradeID, item.name, item.old, item.new,
+			"subscription "+subKey(item.name, name)+" stopped by user decision")
+	}
+	for _, r := range handoff.resume {
+		m.recordSwitch(SwitchSubCheck, upgradeID, item.name, item.old, item.new,
+			fmt.Sprintf("subscription %s resumes on the new version at event %d",
+				subKey(item.name, r.Sub), r.NextID))
+	}
+	return m.applySubHandoff(item, handoff)
 }
 
 // CancelUpgrade aborts a prepared upgrade. The old version keeps
@@ -299,6 +380,12 @@ type RollbackReport struct {
 	Accepted           []string
 	Rejected           []string
 	StateFullyAccepted bool
+	// Subscription handback: which subscriptions the old build can
+	// resume (from the last confirmed event, never replaying them)
+	// and which it cannot explain at all.
+	AcceptedSubs     []string
+	RejectedSubs     []string
+	SubsFullyResumed bool
 }
 
 // Rollback replaces the current build of one extension with a previous
@@ -317,7 +404,7 @@ func (m *Manager) Rollback(name string, previous Manifest) (*RollbackReport, err
 		return nil, err
 	}
 	item := &su.staged[0]
-	report := &RollbackReport{Extension: name, StateFullyAccepted: true}
+	report := &RollbackReport{Extension: name, StateFullyAccepted: true, SubsFullyResumed: true}
 	if item.old != nil {
 		report.FromVersion, report.FromSession = item.old.extVer, item.old.session
 	}
@@ -353,8 +440,46 @@ func (m *Manager) Rollback(name string, previous Manifest) (*RollbackReport, err
 		}
 		m.recordSwitch(SwitchConfirmed, su.id, name, item.old, item.new,
 			fmt.Sprintf("rollback confirmed; %d state items returned to the old build", len(accepted)))
+
+		// Subscription progress the new version accumulated must be
+		// explainable by the old build: it resumes each subscription at
+		// the last externally confirmed event, so nothing already
+		// confirmed is replayed and nothing unconfirmed is skipped.
+		if _, err := item.old.querySubs(m.nextReqID(), m.cfg.TaskTimeout); err != nil {
+			m.abortUpgrade(su.id, su.staged, su.prepared, err, su.stop)
+			return nil, fmt.Errorf("rollback: dump %s subscription progress: %w", name, err)
+		}
+		m.mu.Lock()
+		var resume []protocol.SubProgress
+		for _, s := range m.subs {
+			if s.extension != name || !s.active {
+				continue
+			}
+			if item.new.subs[s.name] {
+				report.AcceptedSubs = append(report.AcceptedSubs, s.name)
+				resume = append(resume, protocol.SubProgress{Sub: s.name, NextID: s.ackedUpTo + 1})
+			} else {
+				report.RejectedSubs = append(report.RejectedSubs, s.name)
+				s.active = false
+			}
+		}
+		m.mu.Unlock()
+		sort.Strings(report.AcceptedSubs)
+		sort.Strings(report.RejectedSubs)
+		report.SubsFullyResumed = len(report.RejectedSubs) == 0
+		if len(resume) > 0 {
+			if err := item.new.loadSubs(m.nextReqID(), resume, m.cfg.TaskTimeout); err != nil {
+				m.abortUpgrade(su.id, su.staged, su.prepared, err, su.stop)
+				return nil, fmt.Errorf("rollback: resume subscriptions on old build: %w", err)
+			}
+		}
+		m.recordSwitch(SwitchSubCheck, su.id, name, item.old, item.new,
+			fmt.Sprintf("rollback: old build resumes subscriptions %v, cannot explain %v",
+				report.AcceptedSubs, report.RejectedSubs))
 	}
-	m.finishUpgrade(su)
+	if err := m.finishUpgrade(su, false); err != nil {
+		return nil, err
+	}
 	return report, nil
 }
 

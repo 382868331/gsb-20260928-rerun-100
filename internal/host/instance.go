@@ -33,7 +33,12 @@ type Instance struct {
 
 	cmd   *exec.Cmd
 	stdin io.WriteCloser
-	done  chan struct{} // closed when the process exits
+	done  chan struct{}   // closed when the process exits
+	subs  map[string]bool // subscriptions this build declared at handshake
+
+	// onSubEvent routes delivered subscription events to the manager's
+	// ledger. Set by the manager right after spawn.
+	onSubEvent func(*Instance, []protocol.SubEvent)
 
 	mu      sync.Mutex
 	pending map[string]*pendingCall
@@ -136,6 +141,10 @@ func spawn(mf Manifest, handshakeTimeout time.Duration) (*Instance, error) {
 		for _, c := range ack.Caps {
 			inst.caps[c.Name] = c.Version
 		}
+		inst.subs = map[string]bool{}
+		for _, s := range ack.SubNames {
+			inst.subs[s] = true
+		}
 	case err := <-errCh:
 		_ = cmd.Process.Kill()
 		return nil, fmt.Errorf("read hello_ack: %w", err)
@@ -176,6 +185,12 @@ func (inst *Instance) serve(stdout io.Reader) {
 		}
 		if msg.Type == protocol.TypeStatePush {
 			inst.noteStatePush(msg.Items)
+			continue
+		}
+		if msg.Type == protocol.TypeSubEvent {
+			if cb := inst.onSubEvent; cb != nil && len(msg.Events) > 0 {
+				cb(inst, msg.Events)
+			}
 			continue
 		}
 		inst.mu.Lock()
@@ -293,6 +308,43 @@ func (inst *Instance) checkState(id string, items []protocol.StateItem, timeout 
 		return nil, nil, fmt.Errorf("expected state_check_result, got %q", resp.Type)
 	}
 	return resp.Accepted, resp.Rejected, nil
+}
+
+// querySubs asks the extension to report the emit positions of its
+// active subscriptions.
+func (inst *Instance) querySubs(id string, timeout time.Duration) ([]protocol.SubProgress, error) {
+	resp, err := inst.request(&protocol.Message{Type: protocol.TypeSubQuery, ID: id}, timeout)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Type != protocol.TypeSubProgress {
+		return nil, fmt.Errorf("expected sub_progress, got %q", resp.Type)
+	}
+	return resp.Subs, nil
+}
+
+// loadSubs hands subscription resume positions to the extension.
+func (inst *Instance) loadSubs(id string, subs []protocol.SubProgress, timeout time.Duration) error {
+	resp, err := inst.request(&protocol.Message{Type: protocol.TypeSubLoad, ID: id, Subs: subs}, timeout)
+	if err != nil {
+		return err
+	}
+	if resp.Type != protocol.TypeSubLoaded {
+		return fmt.Errorf("expected sub_loaded, got %q", resp.Type)
+	}
+	return nil
+}
+
+// stopSub tells the extension to stop one subscription for good.
+func (inst *Instance) stopSub(id, name string, timeout time.Duration) error {
+	resp, err := inst.request(&protocol.Message{Type: protocol.TypeSubStop, ID: id, Name: name}, timeout)
+	if err != nil {
+		return err
+	}
+	if resp.Type != protocol.TypeSubStopped {
+		return fmt.Errorf("expected sub_stopped, got %q", resp.Type)
+	}
+	return nil
 }
 
 // loadState hands state items to the extension for adoption.

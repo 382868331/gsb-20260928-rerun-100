@@ -27,6 +27,7 @@ const (
 	SwitchValidate    = "validate"     // candidate set passed topology checks
 	SwitchPrepared    = "prepared"     // new instance passed handshake/cap checks
 	SwitchStateCheck  = "state_check"  // old session state inspected, candidate compatibility known
+	SwitchSubCheck    = "sub_check"    // subscription progress inspected, handoff decided
 	SwitchConfirmed   = "confirmed"    // user confirmed the migration and its dispositions
 	SwitchCutover     = "cutover"      // new tasks now route to the new instance
 	SwitchActivated   = "activated"    // old instance drained; new version live
@@ -51,6 +52,17 @@ type SwitchRecord struct {
 	Detail     string    `json:"detail,omitempty"`
 }
 
+// AckRecord attributes one externally confirmed subscription event to
+// the exact extension version and session responsible for it.
+type AckRecord struct {
+	Time         time.Time `json:"time"`
+	Extension    string    `json:"extension"`
+	Subscription string    `json:"subscription"`
+	EventID      uint64    `json:"event_id"`
+	Version      string    `json:"version"`
+	Session      string    `json:"session"`
+}
+
 // Journal appends task records to a JSON-lines file.
 type Journal struct {
 	mu       sync.Mutex
@@ -58,6 +70,7 @@ type Journal struct {
 	enc      *json.Encoder
 	records  []JournalEntry
 	switches []SwitchRecord
+	acks     []AckRecord
 }
 
 func OpenJournal(path string) (*Journal, error) {
@@ -96,6 +109,27 @@ func (j *Journal) Switch(s SwitchRecord) {
 		b, _ := json.Marshal(&s)
 		_, _ = j.f.Write(append(b, '\n'))
 	}
+}
+
+// Ack appends one subscription-event confirmation record.
+func (j *Journal) Ack(a AckRecord) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	a.Time = time.Now().UTC()
+	j.acks = append(j.acks, a)
+	if j.enc != nil {
+		b, _ := json.Marshal(&a)
+		_, _ = j.f.Write(append(b, '\n'))
+	}
+}
+
+// AckRecords returns a copy of every confirmation record observed.
+func (j *Journal) AckRecords() []AckRecord {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]AckRecord, len(j.acks))
+	copy(out, j.acks)
+	return out
 }
 
 // SwitchRecords returns a copy of every handoff record observed.

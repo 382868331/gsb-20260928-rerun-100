@@ -51,7 +51,7 @@ func main() {
 		{
 			Name:     "textkit",
 			Path:     filepath.Join(binDir, "textkit"),
-			Provides: []string{"uppercase", "wordcount", "sleep", "panic"},
+			Provides: []string{"uppercase", "wordcount", "sleep", "panic", "emit"},
 			// textkit's hashupper pipeline depends on hashkit, so it
 			// must start after hashkit and only if sha256 is live.
 			Requires: []string{"sha256"},
@@ -94,6 +94,14 @@ func main() {
 	fmt.Println("[task] uppercase after restart ->",
 		mustJSON(mgr.Call("uppercase", map[string]string{"text": "back online"})))
 
+	// --- Persistent subscription ------------------------------------
+	// textkit streams identified "ticks" events; the host ledger
+	// records every delivery and each external confirmation is
+	// attributed to the exact version/session responsible for it.
+	fmt.Println("[task] emit ticks   ->", mustJSON(mgr.Call("emit", map[string]any{"sub": "ticks", "count": 3})))
+	waitForSubEvents(mgr, "textkit", "ticks", 3)
+	ackAll(mgr, "textkit", "ticks")
+
 	// --- Dependency-ordered upgrade -------------------------------
 	// Both extensions move to a new build (same trusted local binary,
 	// new version stamp). Old processes keep serving while candidates
@@ -115,7 +123,7 @@ func main() {
 			// 1.3.0 no longer understands the legacy upper_calls key,
 			// so the preview reports it as incompatible.
 			Env:      []string{"TEXTKIT_VERSION=1.3.0", "TEXTKIT_STATE_KEYS=docs_processed"},
-			Provides: []string{"uppercase", "wordcount", "sleep", "panic"},
+			Provides: []string{"uppercase", "wordcount", "sleep", "panic", "emit"},
 			Requires: []string{"sha256"},
 		},
 	}
@@ -126,19 +134,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("upgrade preparation failed, old combination must still serve: %v", err)
 	}
-	decisions := map[string]host.Disposition{}
+	decisions := host.ConfirmDecisions{State: map[string]host.Disposition{}}
 	for _, s := range plan.Sessions {
 		fmt.Printf("[state] %s %s -> %s: old session %s... holds %d items, candidate accepts %v, rejects %v\n",
 			s.Extension, s.OldVersion, s.NewVersion, s.OldSession[:8], len(s.Items), s.Accepted, s.Rejected)
 		for _, it := range s.Items {
 			fmt.Printf("[state]   item %-16s v%d %s\n", it.Key, it.Version, string(it.Value))
 		}
+		for _, sp := range s.Subs {
+			fmt.Printf("[sub]   %s/%s: next=%d acked=%d pending=%v uncertain=%v candidate-can-resume=%v\n",
+				s.Extension, sp.Name, sp.NextID, sp.AckedUpTo, sp.Pending, sp.Uncertain, sp.CanResume)
+		}
 		if len(s.Rejected) > 0 {
 			// Explicit user decision: migrate the accepted items and
 			// drop what the new build cannot interpret.
 			fmt.Printf("[state] %s: %d incompatible items, deciding migrate (accepted kept, rejected dropped)\n",
 				s.Extension, len(s.Rejected))
-			decisions[s.Extension] = host.DecideMigrate
+			decisions.State[s.Extension] = host.DecideMigrate
 		}
 	}
 	if err := mgr.ConfirmUpgrade(plan.ID, decisions); err != nil {
@@ -164,6 +176,21 @@ func main() {
 	fmt.Println("[task] uppercase after upgrade ->",
 		mustJSON(mgr.Call("uppercase", map[string]string{"text": "served by new build"})))
 
+	// The ticks subscription resumed on the new build right after the
+	// last confirmed event; new confirmations belong to the new version.
+	fmt.Println("[task] emit ticks   ->", mustJSON(mgr.Call("emit", map[string]any{"sub": "ticks", "count": 2})))
+	waitForSubEvents(mgr, "textkit", "ticks", 5)
+	ackAll(mgr, "textkit", "ticks")
+	for _, st := range mgr.Subscriptions("textkit") {
+		for _, ev := range st.Events {
+			owner := ev.Version
+			if !ev.Acked {
+				owner = "unconfirmed (delivered by " + ev.Version + ")"
+			}
+			fmt.Printf("[sub]   textkit/%s event %d acked=%v owner=%s\n", st.Name, ev.ID, ev.Acked, owner)
+		}
+	}
+
 	// --- Failed upgrade keeps the old combination -------------------
 	// This candidate declares a capability the binary does not
 	// implement, so it is rejected during preparation. The running
@@ -172,7 +199,7 @@ func main() {
 		Name:     "textkit",
 		Path:     filepath.Join(binDir, "textkit"),
 		Env:      []string{"TEXTKIT_VERSION=9.9.9"},
-		Provides: []string{"uppercase", "wordcount", "sleep", "panic", "fly"},
+		Provides: []string{"uppercase", "wordcount", "sleep", "panic", "emit", "fly"},
 		Requires: []string{"sha256"},
 	}}
 	before := mgr.Session("textkit")
@@ -192,14 +219,15 @@ func main() {
 		Name:     "textkit",
 		Path:     filepath.Join(binDir, "textkit"),
 		Env:      []string{"TEXTKIT_VERSION=1.2.0"},
-		Provides: []string{"uppercase", "wordcount", "sleep", "panic"},
+		Provides: []string{"uppercase", "wordcount", "sleep", "panic", "emit"},
 		Requires: []string{"sha256"},
 	})
 	if err != nil {
 		log.Fatalf("rollback failed: %v", err)
 	}
-	fmt.Printf("[rollback] textkit %s -> %s: state fully restored=%v accepted=%v rejected=%v\n",
-		report.FromVersion, report.ToVersion, report.StateFullyAccepted, report.Accepted, report.Rejected)
+	fmt.Printf("[rollback] textkit %s -> %s: state fully restored=%v accepted=%v rejected=%v subs resumed=%v not-explainable=%v\n",
+		report.FromVersion, report.ToVersion, report.StateFullyAccepted, report.Accepted, report.Rejected,
+		report.AcceptedSubs, report.RejectedSubs)
 	if !report.StateFullyAccepted {
 		fmt.Println("[rollback] WARNING: old build could not receive all state; session state only partially restored")
 	}
@@ -222,6 +250,39 @@ func main() {
 	fmt.Println("[host] shutting down: stop accepting, drain, exit")
 	mgr.Shutdown()
 	fmt.Println("[host] all extensions exited cleanly; task journal at state/tasks.jsonl")
+}
+
+// waitForSubEvents polls the ledger until the subscription has
+// delivered at least n events (deliveries are asynchronous pushes).
+func waitForSubEvents(mgr *host.Manager, ext, sub string, n int) {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, st := range mgr.Subscriptions(ext) {
+			if st.Name == sub && len(st.Events) >= n {
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	log.Fatalf("subscription %s/%s did not deliver %d events in time", ext, sub, n)
+}
+
+// ackAll externally confirms every delivered event of a subscription
+// and prints who the ledger holds responsible for each confirmation.
+func ackAll(mgr *host.Manager, ext, sub string) {
+	for _, st := range mgr.Subscriptions(ext) {
+		if st.Name != sub {
+			continue
+		}
+		for _, ev := range st.Events {
+			if ev.Acked {
+				continue
+			}
+			if err := mgr.AckEvent(ext, sub, ev.ID); err != nil {
+				log.Fatalf("ack %s/%s event %d: %v", ext, sub, ev.ID, err)
+			}
+		}
+	}
 }
 
 func short(s string) string {

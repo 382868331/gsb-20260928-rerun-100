@@ -39,6 +39,51 @@ func helperExt() {
 		}
 	}
 	ext.DeclareStateKeys(stateKeys...)
+	var subs []string
+	for _, s := range strings.Split(os.Getenv("EXTSYS_TEST_SUBS"), ",") {
+		if s != "" {
+			subs = append(subs, s)
+		}
+	}
+	ext.DeclareSubscriptions(subs...)
+	// Every capability whose name starts with "emit" is an event
+	// emitter; the distinct names let several extensions in one test
+	// each provide their own emitter without a provider conflict.
+	for c := range caps {
+		if !strings.HasPrefix(c, "emit") {
+			continue
+		}
+		ext.Handle(c, 1, func(p json.RawMessage) (any, error) {
+			var in struct {
+				Sub         string `json:"sub"`
+				Count       int    `json:"count"`
+				DelayMillis int    `json:"delay_millis"`
+			}
+			if err := json.Unmarshal(p, &in); err != nil {
+				return nil, err
+			}
+			if in.Count <= 0 {
+				in.Count = 1
+			}
+			// The first event is emitted synchronously so a stopped or
+			// undeclared subscription fails the task; the rest stream
+			// in the background.
+			if _, err := ext.Emit(in.Sub, map[string]int{"n": 0}); err != nil {
+				return nil, err
+			}
+			go func() {
+				for i := 1; i < in.Count; i++ {
+					if in.DelayMillis > 0 {
+						time.Sleep(time.Duration(in.DelayMillis) * time.Millisecond)
+					}
+					if _, err := ext.Emit(in.Sub, map[string]int{"n": i}); err != nil {
+						return
+					}
+				}
+			}()
+			return map[string]string{"ok": "emitting"}, nil
+		})
+	}
 	if caps["bump"] {
 		ext.Handle("bump", 1, func(p json.RawMessage) (any, error) {
 			var in struct {

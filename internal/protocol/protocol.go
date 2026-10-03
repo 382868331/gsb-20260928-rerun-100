@@ -35,6 +35,20 @@ const (
 	TypeStateLoaded      = "state_loaded"       // ext -> host: state adopted
 )
 
+// Subscription message types. A stateful extension may additionally
+// hold persistent subscriptions that keep producing identified events;
+// the host tracks per-event progress so an upgrade can hand the stream
+// over without losing or double-confirming events.
+const (
+	TypeSubEvent    = "sub_event"    // ext -> host: unsolicited event delivery
+	TypeSubQuery    = "sub_query"    // host -> ext: report your subscription progress
+	TypeSubProgress = "sub_progress" // ext -> host: per-subscription emit positions
+	TypeSubLoad     = "sub_load"     // host -> ext: resume these subscriptions at these positions
+	TypeSubLoaded   = "sub_loaded"   // ext -> host: resume positions adopted
+	TypeSubStop     = "sub_stop"     // host -> ext: stop this subscription (user decision)
+	TypeSubStopped  = "sub_stopped"  // ext -> host: subscription stopped
+)
+
 // Capability is a named, versioned operation an extension can perform.
 type Capability struct {
 	Name    string `json:"name"`
@@ -52,6 +66,25 @@ type StateItem struct {
 	Version uint64          `json:"version"`
 }
 
+// SubEvent is one identified event delivered by a subscription. IDs are
+// assigned by the producing extension as a per-subscription monotonic
+// sequence, so the same event keeps its identity across versions and
+// duplicate deliveries can be recognised.
+type SubEvent struct {
+	Sub     string          `json:"sub"`
+	ID      uint64          `json:"id"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+// SubProgress describes one subscription's emit position. NextID is the
+// ID the extension will assign to the next event it emits; every ID
+// below it has already been emitted (and the host either saw it or must
+// treat the gap as uncertain).
+type SubProgress struct {
+	Sub    string `json:"sub"`
+	NextID uint64 `json:"next_id"`
+}
+
 // Message is the single envelope used in both directions. Fields are
 // populated according to Type.
 type Message struct {
@@ -61,11 +94,14 @@ type Message struct {
 	Name     string          `json:"name,omitempty"`
 	ExtVer   string          `json:"ext_version,omitempty"`
 	Caps     []Capability    `json:"capabilities,omitempty"`
+	SubNames []string        `json:"sub_names,omitempty"`
 	ID       string          `json:"id,omitempty"`
 	Cap      string          `json:"capability,omitempty"`
 	Payload  json.RawMessage `json:"payload,omitempty"`
 	Err      string          `json:"error,omitempty"`
 	Items    []StateItem     `json:"items,omitempty"`
+	Events   []SubEvent      `json:"events,omitempty"`
+	Subs     []SubProgress   `json:"subs,omitempty"`
 	Accepted []string        `json:"accepted,omitempty"`
 	Rejected []string        `json:"rejected,omitempty"`
 }
