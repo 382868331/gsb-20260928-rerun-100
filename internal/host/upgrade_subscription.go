@@ -95,6 +95,9 @@ func (m *Manager) transferSubscriptions(item *stagedItem, previews []Subscriptio
 	if err := next.loadSubscriptions(m.nextReqID(), live, m.cfg.TaskTimeout); err != nil {
 		return fmt.Errorf("load subscriptions into new %s: %w", item.name, err)
 	}
+	for id := range stopped {
+		_ = m.state.RemoveSubscription(item.name, id)
+	}
 	var markers []protocol.EventProgress
 	for _, ev := range confirmed {
 		markers = append(markers, ev)
@@ -120,6 +123,7 @@ func (m *Manager) transferSubscriptions(item *stagedItem, previews []Subscriptio
 				forward = append(forward, ev)
 			}
 			mu.Unlock()
+			_ = m.state.SaveEvents(item.name, []protocol.EventProgress{ev})
 		}
 		if len(forward) > 0 {
 			_ = next.loadEvents(m.nextReqID(), forward, m.cfg.TaskTimeout)

@@ -7,7 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +41,7 @@ type Config struct {
 	TaskTimeout      time.Duration
 	ShutdownGrace    time.Duration
 	Journal          *Journal
+	StateDir         string
 }
 
 // Manager owns the lifecycle of all extension processes.
@@ -59,21 +64,50 @@ type Manager struct {
 
 	upgradeMu sync.Mutex // serialises overlapping upgrade attempts
 	upgrading sync.WaitGroup
+
+	state *StateStore
 }
 
 // New validates manifests and resolves the dependency order. Any
 // missing requirement or dependency cycle fails here, before anything
 // runs.
 func New(manifests []Manifest, cfg Config) (*Manager, error) {
+	var state *StateStore
+	if cfg.StateDir != "" {
+		if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
+			return nil, err
+		}
+		var err error
+		state, err = OpenStateStore(filepath.Join(cfg.StateDir, "host-state.jsonl"))
+		if err != nil {
+			return nil, err
+		}
+	}
 	m := &Manager{
 		cfg:       cfg,
 		manifests: map[string]Manifest{},
 		instances: map[string]*Instance{},
 		providers: map[string]string{},
 		owners:    map[string]SessionOwnership{},
+		state:     state,
+	}
+	for session, owner := range state.Owners() {
+		m.owners[session] = owner
+	}
+	m.restoreSequenceNumbers()
+	persistedManifests := state.Manifests()
+	for i := range manifests {
+		if mf, ok := persistedManifests[manifests[i].Name]; ok {
+			manifests[i] = mf
+			delete(persistedManifests, mf.Name)
+		}
+	}
+	for _, mf := range persistedManifests {
+		manifests = append(manifests, mf)
 	}
 	order, err := validateManifests(manifests, m.manifests)
 	if err != nil {
+		_ = state.Close()
 		return nil, err
 	}
 	m.order = order
@@ -188,9 +222,65 @@ func (m *Manager) Start() error {
 			m.providers[c] = name
 		}
 		started = append(started, name)
+		m.attachInstanceState(name, inst)
+		if err := m.restoreInstanceState(name, inst); err != nil {
+			inst.shutdown(m.cfg.ShutdownGrace)
+			m.rollback(started)
+			return err
+		}
 		m.setOwner(inst.session, name, inst.extVer, true, "started")
 	}
 	return nil
+}
+
+func (m *Manager) attachInstanceState(name string, inst *Instance) {
+	if m.state == nil {
+		return
+	}
+	inst.setSubscriptionSink(func(subs []protocol.SubscriptionScope) {
+		_ = m.state.SaveSubscriptions(name, subs)
+	})
+	inst.setEventSink(func(events []protocol.EventProgress) {
+		_ = m.state.SaveEvents(name, events)
+	})
+}
+
+func (m *Manager) restoreInstanceState(name string, inst *Instance) error {
+	if m.state == nil {
+		return nil
+	}
+	subs, events := m.state.Restore(name)
+	if err := inst.adoptState(m.nextReqID(), m.nextReqID(), subs, events, m.cfg.TaskTimeout); err != nil {
+		return fmt.Errorf("restore %s durable progress: %w", name, err)
+	}
+	return nil
+}
+
+func (m *Manager) restoreSequenceNumbers() {
+	if m.cfg.Journal == nil {
+		return
+	}
+	for _, rec := range m.cfg.Journal.TaskRecords() {
+		if n := trailingSequence(rec.TaskID, "task-"); n > m.taskSeq {
+			m.taskSeq = n
+		}
+	}
+	for _, rec := range m.cfg.Journal.SwitchRecords() {
+		if n := trailingSequence(rec.UpgradeID, "upgrade-"); n > m.switchSeq {
+			m.switchSeq = n
+		}
+	}
+}
+
+func trailingSequence(value, prefix string) int {
+	if !strings.HasPrefix(value, prefix) {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(value, prefix))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }
 
 // verifyInstance checks a freshly spawned candidate before it is
@@ -317,6 +407,11 @@ func (m *Manager) Restart(name string) error {
 	}
 	inst, err := spawn(mf, m.cfg.HandshakeTimeout)
 	if err != nil {
+		return err
+	}
+	m.attachInstanceState(name, inst)
+	if err := m.restoreInstanceState(name, inst); err != nil {
+		inst.shutdown(m.cfg.ShutdownGrace)
 		return err
 	}
 	m.instances[name] = inst
@@ -459,6 +554,7 @@ func (m *Manager) prepareUpgrade(candidates []Manifest) (*stagedUpgrade, error) 
 			m.abortUpgrade(upgradeID, staged, prepared, err, stop)
 			return nil, err
 		}
+		m.attachInstanceState(name, inst)
 		item.new = inst
 		prepared[name] = inst
 		old := item.old
@@ -485,6 +581,15 @@ func (m *Manager) finishUpgrade(su *stagedUpgrade) {
 	byName := su.byName
 	next := su.next
 	stop := su.stop
+	for _, item := range staged {
+		if item.name != "" {
+			if err := m.state.SaveManifest(next[item.name]); err != nil {
+				closeErr := fmt.Errorf("persist switch decision for %s: %w", item.name, err)
+				m.abortUpgrade(upgradeID, staged, su.prepared, closeErr, stop)
+				return
+			}
+		}
+	}
 	// All candidates are valid. Cut over atomically: new tasks now go
 	// only to the new instances. Calls already in flight keep holding
 	// the old Instance pointer, so a task is never delivered twice.
@@ -665,6 +770,9 @@ func (m *Manager) Shutdown() {
 			m.setOwner(inst.session, name, inst.extVer, false, "host shutdown")
 			inst.shutdown(m.cfg.ShutdownGrace)
 		}
+	}
+	if m.state != nil {
+		_ = m.state.Close()
 	}
 }
 

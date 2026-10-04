@@ -63,6 +63,7 @@ func main() {
 		TaskTimeout:      1500 * time.Millisecond,
 		ShutdownGrace:    2 * time.Second,
 		Journal:          journal,
+		StateDir:         "state",
 	})
 	if err != nil {
 		log.Fatalf("manifest check failed before anything started: %v", err)

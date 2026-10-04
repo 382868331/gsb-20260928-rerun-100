@@ -3,6 +3,7 @@ package host
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 
 	"extsys/internal/protocol"
@@ -38,7 +39,11 @@ func (m *Manager) setOwnerLocked(session, ext, ver string, active bool, note str
 	if session == "" {
 		return
 	}
-	m.owners[session] = SessionOwnership{Extension: ext, Version: ver, Active: active, Note: note}
+	owner := SessionOwnership{Extension: ext, Version: ver, Active: active, Note: note}
+	m.owners[session] = owner
+	if m.state != nil {
+		_ = m.state.SaveOwnerSession(session, owner)
+	}
 }
 
 // Disposition is the user's decision for one session whose saved state
@@ -229,6 +234,32 @@ func (m *Manager) ConfirmUpgrade(planID string, decisions map[string]Disposition
 	plan = m.takePlan(planID)
 	if plan == nil {
 		return fmt.Errorf("prepared upgrade %q was interrupted", planID)
+	}
+	for extension, decision := range decisions {
+		subscription := ""
+		if strings.HasPrefix(extension, "subscription:") {
+			subscription = strings.TrimPrefix(extension, "subscription:")
+			extension = ""
+			for _, session := range plan.Sessions {
+				for _, preview := range session.Subscriptions {
+					if preview.Scope.ID == subscription {
+						extension = session.Extension
+						break
+					}
+				}
+				if extension != "" {
+					break
+				}
+			}
+		}
+		if extension != "" {
+			if err := m.state.SaveDecision(planID, extension, subscription, decision); err != nil {
+				m.takePlan(planID)
+				m.upgrading.Done()
+				m.upgradeMu.Unlock()
+				return fmt.Errorf("persist switch decision: %w", err)
+			}
+		}
 	}
 	defer m.upgrading.Done()
 	defer m.upgradeMu.Unlock()

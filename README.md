@@ -74,6 +74,11 @@ drained / activated / abort / rollback）通过 Journal.SwitchRecords
   新版本已经确认的重复结果也不会被旧版本覆盖。
 - Rollback 先核对旧构建能否解释新版本的全部订阅和确认边界；不能安全确定时
   不切回、不重放，新版本继续负责并返回包含订阅不确定范围的 RollbackReport。
+- 宿主使用同一 `state` 目录重启时会重放 `host-state.jsonl`：订阅范围、
+  received/processing/confirmed 事件账本、会话最后负责版本、最终切换采用的
+  扩展清单和用户切换决定都会恢复。新进程握手后先装回这些进度，已确认事件
+  不会再次执行；JSONL 末尾因崩溃产生的不完整行会被忽略，前序完整记录仍可
+  继续追加处理。
 - cmd/host — 主程序演示；cmd/textkit、cmd/hashkit 为两个自带扩展。
 
 textkit 额外提供 sleep（慢任务，用于超时验证）和 panic（异常退出，

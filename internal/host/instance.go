@@ -41,12 +41,13 @@ type Instance struct {
 
 	bye chan struct{} // closed when the extension sends bye
 
-	stateMu       sync.Mutex
-	pushedState   map[string]protocol.StateItem // async pushes, merged by version
-	stateSink     func([]protocol.StateItem)    // set post-cutover to forward late pushes
-	eventSink     func([]protocol.EventProgress)
-	subscriptions map[string]protocol.SubscriptionScope
-	events        map[string]protocol.EventProgress
+	stateMu          sync.Mutex
+	pushedState      map[string]protocol.StateItem // async pushes, merged by version
+	stateSink        func([]protocol.StateItem)    // set post-cutover to forward late pushes
+	eventSink        func([]protocol.EventProgress)
+	subscriptionSink func([]protocol.SubscriptionScope)
+	subscriptions    map[string]protocol.SubscriptionScope
+	events           map[string]protocol.EventProgress
 }
 
 // EndReason explains why a wait on an instance finished.
@@ -217,9 +218,14 @@ func eventKey(ev protocol.EventProgress) string {
 
 func (inst *Instance) noteSubscriptions(subs []protocol.SubscriptionScope) {
 	inst.stateMu.Lock()
-	defer inst.stateMu.Unlock()
 	for _, sub := range subs {
 		inst.subscriptions[sub.ID] = sub
+	}
+	var sink func([]protocol.SubscriptionScope)
+	sink = inst.subscriptionSink
+	inst.stateMu.Unlock()
+	if sink != nil {
+		sink(subs)
 	}
 }
 
@@ -312,6 +318,49 @@ func (inst *Instance) setEventSink(sink func([]protocol.EventProgress)) {
 	inst.stateMu.Lock()
 	defer inst.stateMu.Unlock()
 	inst.eventSink = sink
+}
+
+func (inst *Instance) setSubscriptionSink(sink func([]protocol.SubscriptionScope)) {
+	inst.stateMu.Lock()
+	defer inst.stateMu.Unlock()
+	inst.subscriptionSink = sink
+}
+
+func (inst *Instance) seedSubscriptions(subs []protocol.SubscriptionScope) {
+	inst.stateMu.Lock()
+	defer inst.stateMu.Unlock()
+	for _, sub := range subs {
+		inst.subscriptions[sub.ID] = sub
+	}
+}
+
+func (inst *Instance) seedEvents(events []protocol.EventProgress) {
+	inst.stateMu.Lock()
+	defer inst.stateMu.Unlock()
+	for _, ev := range events {
+		k := eventKey(ev)
+		cur := inst.events[k]
+		if eventRank(ev.Status) > eventRank(cur.Status) ||
+			(eventRank(ev.Status) == eventRank(cur.Status) && ev.Position > cur.Position) {
+			inst.events[k] = ev
+		}
+	}
+}
+
+func (inst *Instance) adoptState(subscriptionID, eventID string, subs []protocol.SubscriptionScope, events []protocol.EventProgress, timeout time.Duration) error {
+	if len(subs) > 0 {
+		if err := inst.loadSubscriptions(subscriptionID, subs, timeout); err != nil {
+			return err
+		}
+	}
+	inst.seedSubscriptions(subs)
+	if len(events) > 0 {
+		if err := inst.loadEvents(eventID, events, timeout); err != nil {
+			return err
+		}
+	}
+	inst.seedEvents(events)
+	return nil
 }
 
 // querySubscriptions returns durable subscription scopes and the current

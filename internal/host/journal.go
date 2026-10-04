@@ -1,7 +1,9 @@
 package host
 
 import (
+	"bufio"
 	"encoding/json"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -61,11 +63,48 @@ type Journal struct {
 }
 
 func OpenJournal(path string) (*Journal, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return nil, err
 	}
-	return &Journal{enc: json.NewEncoder(f), f: f}, nil
+	j := &Journal{enc: json.NewEncoder(f), f: f}
+	if err := j.replay(f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return j, nil
+}
+
+func (j *Journal) replay(r io.Reader) error {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+		var head struct {
+			TaskID string `json:"task_id"`
+			Event  string `json:"event"`
+		}
+		if err := json.Unmarshal(line, &head); err != nil {
+			continue
+		}
+		if head.Event != "" {
+			var rec SwitchRecord
+			if json.Unmarshal(line, &rec) == nil {
+				j.switches = append(j.switches, rec)
+			}
+			continue
+		}
+		if head.TaskID != "" {
+			var rec JournalEntry
+			if json.Unmarshal(line, &rec) == nil {
+				j.records = append(j.records, rec)
+			}
+		}
+	}
+	return scanner.Err()
 }
 
 // NewMemoryJournal keeps every record in process memory. It is used by
@@ -84,6 +123,7 @@ func (j *Journal) Record(e JournalEntry) {
 		return
 	}
 	_ = j.enc.Encode(&e)
+	_ = j.f.Sync()
 }
 
 // Switch appends one handoff audit record.
@@ -95,6 +135,7 @@ func (j *Journal) Switch(s SwitchRecord) {
 	if j.enc != nil {
 		b, _ := json.Marshal(&s)
 		_, _ = j.f.Write(append(b, '\n'))
+		_ = j.f.Sync()
 	}
 }
 
@@ -116,4 +157,11 @@ func (j *Journal) TaskRecords() []JournalEntry {
 	return out
 }
 
-func (j *Journal) Close() error { return j.f.Close() }
+func (j *Journal) Close() error {
+	if j.f == nil {
+		return nil
+	}
+	err := j.f.Close()
+	j.f = nil
+	return err
+}
