@@ -54,19 +54,35 @@ const (
 	// DecideCancel aborts the whole upgrade; the old version keeps
 	// serving and keeps its state.
 	DecideCancel Disposition = "cancel"
+	// DecideStopSubscription keeps the old version for an unsafe
+	// subscription by explicitly stopping that subscription.
+	DecideStopSubscription Disposition = "stop_subscription"
 )
+
+// SubscriptionPreview shows the durable scope, candidate compatibility,
+// and exact per-event responsibility in a switch plan.
+type SubscriptionPreview struct {
+	Scope          protocol.SubscriptionScope
+	Accepted       bool
+	Events         []protocol.EventProgress
+	Confirmed      []string
+	InFlight       []string
+	SafeToContinue bool
+	Uncertainty    string
+}
 
 // SessionStatePreview describes, for one extension, the state the old
 // session has saved and how the candidate build reacts to it.
 type SessionStatePreview struct {
-	Extension  string
-	OldVersion string
-	OldSession string
-	NewVersion string
-	NewSession string
-	Items      []protocol.StateItem // state saved by the old session
-	Accepted   []string             // keys the candidate can interpret
-	Rejected   []string             // keys the candidate cannot interpret
+	Extension     string
+	OldVersion    string
+	OldSession    string
+	NewVersion    string
+	NewSession    string
+	Items         []protocol.StateItem // state saved by the old session
+	Accepted      []string             // keys the candidate can interpret
+	Rejected      []string             // keys the candidate cannot interpret
+	Subscriptions []SubscriptionPreview
 }
 
 // UpgradePlan is a prepared upgrade awaiting user confirmation. While
@@ -127,9 +143,24 @@ func (m *Manager) PrepareUpgrade(candidates []Manifest) (*UpgradePlan, error) {
 		preview.Rejected = rejected
 		sort.Strings(preview.Accepted)
 		sort.Strings(preview.Rejected)
+		subs, events, err := item.old.querySubscriptions(m.nextReqID(), m.cfg.TaskTimeout)
+		if err != nil {
+			m.abortUpgrade(su.id, su.staged, su.prepared, err, su.stop)
+			m.upgrading.Done()
+			m.upgradeMu.Unlock()
+			return nil, fmt.Errorf("dump %s subscriptions: %w", item.name, err)
+		}
+		subAccepted, subRejected, err := item.new.checkSubscriptions(m.nextReqID(), subs, m.cfg.TaskTimeout)
+		if err != nil {
+			m.abortUpgrade(su.id, su.staged, su.prepared, err, su.stop)
+			m.upgrading.Done()
+			m.upgradeMu.Unlock()
+			return nil, fmt.Errorf("check %s subscriptions: %w", item.name, err)
+		}
+		preview.Subscriptions = buildSubscriptionPreviews(subs, events, subAccepted, subRejected)
 		m.recordSwitch(SwitchStateCheck, su.id, item.name, item.old, item.new,
-			fmt.Sprintf("old session holds %d state items; candidate accepts %d, rejects %d",
-				len(items), len(accepted), len(rejected)))
+			fmt.Sprintf("old session holds %d state items, %d subscriptions; candidate state accepts %d/rejects %d; subscriptions accepted %d/rejected %d",
+				len(items), len(subs), len(accepted), len(rejected), len(subAccepted), len(subRejected)))
 		plan.Sessions = append(plan.Sessions, preview)
 	}
 	m.mu.Lock()
@@ -187,6 +218,12 @@ func (m *Manager) ConfirmUpgrade(planID string, decisions map[string]Disposition
 			return fmt.Errorf("session %s (%s) has %d incompatible state items; explicit decision required",
 				s.Extension, s.OldSession, len(s.Rejected))
 		}
+		for _, sub := range s.Subscriptions {
+			sd := subscriptionDecision(decisions, s.Extension, sub.Scope.ID)
+			if !sub.SafeToContinue && sd != DecideStopSubscription {
+				return fmt.Errorf("subscription %s cannot safely continue: %s; explicit decision required", sub.Scope.ID, sub.Uncertainty)
+			}
+		}
 	}
 
 	plan = m.takePlan(planID)
@@ -215,6 +252,10 @@ func (m *Manager) ConfirmUpgrade(planID string, decisions map[string]Disposition
 		}
 		migrated, err := m.transferState(item, decision, accepted)
 		if err != nil {
+			m.abortUpgrade(plan.su.id, plan.su.staged, plan.su.prepared, err, plan.su.stop)
+			return err
+		}
+		if err := m.transferSubscriptions(item, byName[item.name].Subscriptions, decisions); err != nil {
 			m.abortUpgrade(plan.su.id, plan.su.staged, plan.su.prepared, err, plan.su.stop)
 			return err
 		}
@@ -299,6 +340,8 @@ type RollbackReport struct {
 	Accepted           []string
 	Rejected           []string
 	StateFullyAccepted bool
+	Subscriptions      []SubscriptionPreview
+	SubscriptionSafe   bool
 }
 
 // Rollback replaces the current build of one extension with a previous
@@ -343,11 +386,37 @@ func (m *Manager) Rollback(name string, previous Manifest) (*RollbackReport, err
 		m.recordSwitch(SwitchStateCheck, su.id, name, item.old, item.new,
 			fmt.Sprintf("rollback: old build accepts %d of %d new-state items, rejects %d",
 				len(accepted), len(items), len(rejected)))
+		subs, events, err := item.old.querySubscriptions(m.nextReqID(), m.cfg.TaskTimeout)
+		if err != nil {
+			m.abortUpgrade(su.id, su.staged, su.prepared, err, su.stop)
+			return nil, fmt.Errorf("rollback: dump %s subscriptions: %w", name, err)
+		}
+		subAccepted, subRejected, err := item.new.checkSubscriptions(m.nextReqID(), subs, m.cfg.TaskTimeout)
+		if err != nil {
+			m.abortUpgrade(su.id, su.staged, su.prepared, err, su.stop)
+			return nil, fmt.Errorf("rollback: check %s subscriptions: %w", name, err)
+		}
+		report.Subscriptions = buildSubscriptionPreviews(subs, events, subAccepted, subRejected)
+		report.SubscriptionSafe = true
+		for _, sub := range report.Subscriptions {
+			if !sub.SafeToContinue {
+				report.SubscriptionSafe = false
+			}
+		}
+		if !report.SubscriptionSafe {
+			err := fmt.Errorf("rollback unsafe: old build cannot continue one or more subscriptions without replaying unconfirmed effects")
+			m.abortUpgrade(su.id, su.staged, su.prepared, err, su.stop)
+			return report, err
+		}
 		keep := map[string]bool{}
 		for _, k := range accepted {
 			keep[k] = true
 		}
 		if _, err := m.transferState(item, DecideMigrate, keep); err != nil {
+			m.abortUpgrade(su.id, su.staged, su.prepared, err, su.stop)
+			return nil, err
+		}
+		if err := m.transferSubscriptions(item, report.Subscriptions, nil); err != nil {
 			m.abortUpgrade(su.id, su.staged, su.prepared, err, su.stop)
 			return nil, err
 		}
@@ -376,4 +445,16 @@ func (m *Manager) DumpState(name string) ([]protocol.StateItem, error) {
 		return nil, fmt.Errorf("extension %q is not running", name)
 	}
 	return inst.queryState(m.nextReqID(), m.cfg.TaskTimeout)
+}
+
+// DumpSubscriptions returns a running extension's durable subscriptions
+// and the current per-event progress ledger.
+func (m *Manager) DumpSubscriptions(name string) ([]protocol.SubscriptionScope, []protocol.EventProgress, error) {
+	m.mu.Lock()
+	inst := m.instances[name]
+	m.mu.Unlock()
+	if inst == nil {
+		return nil, nil, fmt.Errorf("extension %q is not running", name)
+	}
+	return inst.querySubscriptions(m.nextReqID(), m.cfg.TaskTimeout)
 }

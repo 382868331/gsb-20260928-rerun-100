@@ -35,6 +35,19 @@ const (
 	TypeStateLoaded      = "state_loaded"       // ext -> host: state adopted
 )
 
+// Subscription and event-progress message types used during upgrades.
+const (
+	TypeSubscriptionsQuery       = "subscriptions_query"
+	TypeSubscriptionsData        = "subscriptions_data"
+	TypeSubscriptionsCheck       = "subscriptions_check"
+	TypeSubscriptionsCheckResult = "subscriptions_check_result"
+	TypeSubscriptionsLoad        = "subscriptions_load"
+	TypeSubscriptionsLoaded      = "subscriptions_loaded"
+	TypeEventProgress            = "event_progress"
+	TypeEventsLoad               = "events_load"
+	TypeEventsLoaded             = "events_loaded"
+)
+
 // Capability is a named, versioned operation an extension can perform.
 type Capability struct {
 	Name    string `json:"name"`
@@ -52,22 +65,41 @@ type StateItem struct {
 	Version uint64          `json:"version"`
 }
 
+// SubscriptionScope identifies one durable stream subscription.
+type SubscriptionScope struct {
+	ID     string `json:"id"`
+	Source string `json:"source"`
+	Cursor string `json:"cursor,omitempty"`
+}
+
+// EventProgress tracks one identified stream event through a subscription.
+type EventProgress struct {
+	SubscriptionID string `json:"subscription_id"`
+	EventID        string `json:"event_id"`
+	Position       uint64 `json:"position"`
+	Status         string `json:"status"`
+	OwnerVersion   string `json:"owner_version,omitempty"`
+	OwnerSession   string `json:"owner_session,omitempty"`
+}
+
 // Message is the single envelope used in both directions. Fields are
 // populated according to Type.
 type Message struct {
-	Type     string          `json:"type"`
-	Protocol int             `json:"protocol,omitempty"`
-	Session  string          `json:"session,omitempty"`
-	Name     string          `json:"name,omitempty"`
-	ExtVer   string          `json:"ext_version,omitempty"`
-	Caps     []Capability    `json:"capabilities,omitempty"`
-	ID       string          `json:"id,omitempty"`
-	Cap      string          `json:"capability,omitempty"`
-	Payload  json.RawMessage `json:"payload,omitempty"`
-	Err      string          `json:"error,omitempty"`
-	Items    []StateItem     `json:"items,omitempty"`
-	Accepted []string        `json:"accepted,omitempty"`
-	Rejected []string        `json:"rejected,omitempty"`
+	Type          string              `json:"type"`
+	Protocol      int                 `json:"protocol,omitempty"`
+	Session       string              `json:"session,omitempty"`
+	Name          string              `json:"name,omitempty"`
+	ExtVer        string              `json:"ext_version,omitempty"`
+	Caps          []Capability        `json:"capabilities,omitempty"`
+	ID            string              `json:"id,omitempty"`
+	Cap           string              `json:"capability,omitempty"`
+	Payload       json.RawMessage     `json:"payload,omitempty"`
+	Err           string              `json:"error,omitempty"`
+	Items         []StateItem         `json:"items,omitempty"`
+	Accepted      []string            `json:"accepted,omitempty"`
+	Rejected      []string            `json:"rejected,omitempty"`
+	Subscriptions []SubscriptionScope `json:"subscriptions,omitempty"`
+	Events        []EventProgress     `json:"events,omitempty"`
 }
 
 // Compatible reports whether a peer speaking protocol version v can

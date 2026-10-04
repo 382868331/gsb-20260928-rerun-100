@@ -41,9 +41,12 @@ type Instance struct {
 
 	bye chan struct{} // closed when the extension sends bye
 
-	stateMu     sync.Mutex
-	pushedState map[string]protocol.StateItem // async pushes, merged by version
-	stateSink   func([]protocol.StateItem)    // set post-cutover to forward late pushes
+	stateMu       sync.Mutex
+	pushedState   map[string]protocol.StateItem // async pushes, merged by version
+	stateSink     func([]protocol.StateItem)    // set post-cutover to forward late pushes
+	eventSink     func([]protocol.EventProgress)
+	subscriptions map[string]protocol.SubscriptionScope
+	events        map[string]protocol.EventProgress
 }
 
 // EndReason explains why a wait on an instance finished.
@@ -84,14 +87,16 @@ func spawn(mf Manifest, handshakeTimeout time.Duration) (*Instance, error) {
 	}
 
 	inst := &Instance{
-		session:     newSessionToken(),
-		cmd:         cmd,
-		stdin:       stdin,
-		done:        make(chan struct{}),
-		pending:     map[string]*pendingCall{},
-		alive:       true,
-		bye:         make(chan struct{}),
-		pushedState: map[string]protocol.StateItem{},
+		session:       newSessionToken(),
+		cmd:           cmd,
+		stdin:         stdin,
+		done:          make(chan struct{}),
+		pending:       map[string]*pendingCall{},
+		alive:         true,
+		bye:           make(chan struct{}),
+		pushedState:   map[string]protocol.StateItem{},
+		subscriptions: map[string]protocol.SubscriptionScope{},
+		events:        map[string]protocol.EventProgress{},
 	}
 
 	hello := &protocol.Message{
@@ -178,6 +183,22 @@ func (inst *Instance) serve(stdout io.Reader) {
 			inst.noteStatePush(msg.Items)
 			continue
 		}
+		if msg.Type == protocol.TypeSubscriptionsData {
+			if msg.ID == "" {
+				inst.noteSubscriptions(msg.Subscriptions)
+				continue
+			}
+		}
+		if msg.Type == protocol.TypeEventProgress {
+			fresh := inst.noteEvents(msg.Events)
+			inst.stateMu.Lock()
+			sink := inst.eventSink
+			inst.stateMu.Unlock()
+			if len(fresh) > 0 && sink != nil {
+				sink(fresh)
+			}
+			continue
+		}
 		inst.mu.Lock()
 		pc, ok := inst.pending[msg.ID]
 		if ok {
@@ -187,6 +208,53 @@ func (inst *Instance) serve(stdout io.Reader) {
 		if ok {
 			pc.ch <- &msg
 		}
+	}
+}
+
+func eventKey(ev protocol.EventProgress) string {
+	return ev.SubscriptionID + "\x00" + ev.EventID
+}
+
+func (inst *Instance) noteSubscriptions(subs []protocol.SubscriptionScope) {
+	inst.stateMu.Lock()
+	defer inst.stateMu.Unlock()
+	for _, sub := range subs {
+		inst.subscriptions[sub.ID] = sub
+	}
+}
+
+func (inst *Instance) noteEvents(events []protocol.EventProgress) []protocol.EventProgress {
+	inst.stateMu.Lock()
+	defer inst.stateMu.Unlock()
+	var fresh []protocol.EventProgress
+	for _, ev := range events {
+		if ev.OwnerVersion == "" {
+			ev.OwnerVersion = inst.extVer
+		}
+		if ev.OwnerSession == "" {
+			ev.OwnerSession = inst.session
+		}
+		key := eventKey(ev)
+		cur, ok := inst.events[key]
+		if !ok || eventRank(ev.Status) > eventRank(cur.Status) ||
+			(eventRank(ev.Status) == eventRank(cur.Status) && ev.Position > cur.Position) {
+			inst.events[key] = ev
+			fresh = append(fresh, ev)
+		}
+	}
+	return fresh
+}
+
+func eventRank(status string) int {
+	switch status {
+	case "received":
+		return 1
+	case "processing":
+		return 2
+	case "confirmed":
+		return 3
+	default:
+		return 0
 	}
 }
 
@@ -238,6 +306,105 @@ func (inst *Instance) setStateSink(sink func([]protocol.StateItem)) {
 	inst.stateMu.Lock()
 	defer inst.stateMu.Unlock()
 	inst.stateSink = sink
+}
+
+func (inst *Instance) setEventSink(sink func([]protocol.EventProgress)) {
+	inst.stateMu.Lock()
+	defer inst.stateMu.Unlock()
+	inst.eventSink = sink
+}
+
+// querySubscriptions returns durable subscription scopes and the current
+// event ledger, including asynchronous updates received while a switch
+// plan was open.
+func (inst *Instance) querySubscriptions(id string, timeout time.Duration) ([]protocol.SubscriptionScope, []protocol.EventProgress, error) {
+	resp, err := inst.request(&protocol.Message{Type: protocol.TypeSubscriptionsQuery, ID: id}, timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+	if resp.Type != protocol.TypeSubscriptionsData {
+		return nil, nil, fmt.Errorf("expected subscriptions_data, got %q", resp.Type)
+	}
+	inst.stateMu.Lock()
+	defer inst.stateMu.Unlock()
+	for _, sub := range resp.Subscriptions {
+		inst.subscriptions[sub.ID] = sub
+	}
+	for _, ev := range resp.Events {
+		k := eventKey(ev)
+		cur, exists := inst.events[k]
+		if !exists || eventRank(ev.Status) > eventRank(cur.Status) ||
+			(eventRank(ev.Status) == eventRank(cur.Status) && ev.Position > cur.Position) {
+			inst.events[k] = ev
+		}
+	}
+	subs := make([]protocol.SubscriptionScope, 0, len(inst.subscriptions))
+	for _, sub := range inst.subscriptions {
+		subs = append(subs, sub)
+	}
+	eventByID := map[string]protocol.EventProgress{}
+	for _, ev := range inst.events {
+		eventByID[eventKey(ev)] = ev
+	}
+	sort.Slice(subs, func(i, j int) bool { return subs[i].ID < subs[j].ID })
+	events := make([]protocol.EventProgress, 0, len(eventByID))
+	for _, ev := range eventByID {
+		events = append(events, ev)
+	}
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].SubscriptionID != events[j].SubscriptionID {
+			return events[i].SubscriptionID < events[j].SubscriptionID
+		}
+		return events[i].Position < events[j].Position
+	})
+	return subs, events, nil
+}
+
+func (inst *Instance) checkSubscriptions(id string, subs []protocol.SubscriptionScope, timeout time.Duration) ([]string, []string, error) {
+	resp, err := inst.request(&protocol.Message{Type: protocol.TypeSubscriptionsCheck, ID: id, Subscriptions: subs}, timeout)
+	if err != nil {
+		return nil, nil, err
+	}
+	if resp.Type != protocol.TypeSubscriptionsCheckResult {
+		return nil, nil, fmt.Errorf("expected subscriptions_check_result, got %q", resp.Type)
+	}
+	return resp.Accepted, resp.Rejected, nil
+}
+
+func (inst *Instance) loadSubscriptions(id string, subs []protocol.SubscriptionScope, timeout time.Duration) error {
+	resp, err := inst.request(&protocol.Message{Type: protocol.TypeSubscriptionsLoad, ID: id, Subscriptions: subs}, timeout)
+	if err != nil {
+		return err
+	}
+	if resp.Type != protocol.TypeSubscriptionsLoaded {
+		return fmt.Errorf("expected subscriptions_loaded, got %q", resp.Type)
+	}
+	return nil
+}
+
+func (inst *Instance) loadEvents(id string, events []protocol.EventProgress, timeout time.Duration) error {
+	resp, err := inst.request(&protocol.Message{Type: protocol.TypeEventsLoad, ID: id, Events: events}, timeout)
+	if err != nil {
+		return err
+	}
+	if resp.Type != protocol.TypeEventsLoaded {
+		return fmt.Errorf("expected events_loaded, got %q", resp.Type)
+	}
+	return nil
+}
+
+// adoptConfirmedEvent installs a confirmation produced by a previous owner
+// unless this instance has already confirmed the duplicate itself.
+func (inst *Instance) adoptConfirmedEvent(ev protocol.EventProgress) bool {
+	inst.stateMu.Lock()
+	defer inst.stateMu.Unlock()
+	cur := inst.events[eventKey(ev)]
+	if cur.Status == "confirmed" {
+		return false
+	}
+	ev.Status = "confirmed"
+	inst.events[eventKey(ev)] = ev
+	return true
 }
 
 // request sends one message and waits for its correlated reply.

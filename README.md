@@ -63,6 +63,17 @@ drained / activated / abort / rollback）通过 Journal.SwitchRecords
   不能接收的在 RollbackReport.Rejected 中列明，StateFullyAccepted 为假
   时说明进程已回退但会话状态只恢复了一部分——不会仅恢复旧进程就声称
   状态已经恢复。
+- 有状态扩展还可以通过 SDK 声明并保存持续订阅、报告带身份事件的
+  received / processing / confirmed 进度。PrepareUpgrade 的每个会话预览
+  同时列出保存状态、订阅范围与逐条事件账本；候选不认识订阅，或仍有未确认
+  事件时，SafeToContinue 为假并显示 Uncertainty，必须取消升级保留旧版，
+  或对该订阅显式使用 stop_subscription，自动升级不能越过该决定。
+- 切换时只把旧版本已经 confirmed 的事件身份作为去重标记交给候选；
+  processing/received 不会被伪装成完成。旧进程在退出前迟到的确认仍归旧会话，
+  宿主只会把事件身份前转给当前负责版本，重复送达不会再次产生外部效果；
+  新版本已经确认的重复结果也不会被旧版本覆盖。
+- Rollback 先核对旧构建能否解释新版本的全部订阅和确认边界；不能安全确定时
+  不切回、不重放，新版本继续负责并返回包含订阅不确定范围的 RollbackReport。
 - cmd/host — 主程序演示；cmd/textkit、cmd/hashkit 为两个自带扩展。
 
 textkit 额外提供 sleep（慢任务，用于超时验证）和 panic（异常退出，

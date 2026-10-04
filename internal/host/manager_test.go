@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"extsys/internal/extsdk"
+	"extsys/internal/protocol"
 )
 
 // helperExt is a synthetic extension used via the test-binary-as-child
@@ -39,6 +40,13 @@ func helperExt() {
 		}
 	}
 	ext.DeclareStateKeys(stateKeys...)
+	var subIDs []string
+	for _, id := range strings.Split(os.Getenv("EXTSYS_TEST_SUB_KEYS"), ",") {
+		if id != "" {
+			subIDs = append(subIDs, id)
+		}
+	}
+	ext.DeclareSubscriptionIDs(subIDs...)
 	if caps["bump"] {
 		ext.Handle("bump", 1, func(p json.RawMessage) (any, error) {
 			var in struct {
@@ -83,6 +91,51 @@ func helperExt() {
 			os.Exit(2)
 			return nil, nil
 		})
+	}
+	handleStream := func(p json.RawMessage) (any, error) {
+		var in struct {
+			Action string `json:"action"`
+			SubID  string `json:"sub_id"`
+			Event  string `json:"event"`
+			Pos    uint64 `json:"pos"`
+			Source string `json:"source"`
+			Cursor string `json:"cursor"`
+			Millis int    `json:"millis"`
+		}
+		if err := json.Unmarshal(p, &in); err != nil {
+			return nil, err
+		}
+		switch in.Action {
+		case "save":
+			return map[string]string{"ok": "saved"}, ext.SaveSubscription(protocol.SubscriptionScope{ID: in.SubID, Source: in.Source, Cursor: in.Cursor})
+		case "report":
+			return map[string]string{"ok": in.Action}, ext.ReportEvent(protocol.EventProgress{SubscriptionID: in.SubID, EventID: in.Event, Position: in.Pos, Status: "processing"})
+		case "confirmed":
+			if !ext.IsConfirmedEvent(in.SubID, in.Event) {
+				var n int
+				if raw, ok := ext.State("effects"); ok {
+					_ = json.Unmarshal(raw, &n)
+				}
+				n++
+				if err := ext.SetState("effects", n); err != nil {
+					return nil, err
+				}
+				if err := ext.ReportEvent(protocol.EventProgress{SubscriptionID: in.SubID, EventID: in.Event, Position: in.Pos, Status: "confirmed"}); err != nil {
+					return nil, err
+				}
+				return map[string]any{"ok": "confirmed", "effects": n}, nil
+			}
+			return map[string]any{"ok": "duplicate", "effects": 0}, nil
+		case "slow_report":
+			time.Sleep(time.Duration(in.Millis) * time.Millisecond)
+			return map[string]string{"ok": "reported"}, ext.ReportEvent(protocol.EventProgress{SubscriptionID: in.SubID, EventID: in.Event, Position: in.Pos, Status: "confirmed"})
+		}
+		return nil, fmt.Errorf("unknown stream action %q", in.Action)
+	}
+	for capName := range caps {
+		if capName == "stream" || strings.HasPrefix(capName, "stream_") {
+			ext.Handle(capName, 1, handleStream)
+		}
 	}
 	if err := ext.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

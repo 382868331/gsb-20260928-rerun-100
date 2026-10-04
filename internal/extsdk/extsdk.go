@@ -31,6 +31,9 @@ type Extension struct {
 	state      map[string]protocol.StateItem
 	stateSeq   uint64
 	knownState map[string]bool
+	subs       map[string]protocol.SubscriptionScope
+	knownSubs  map[string]bool
+	events     map[string]protocol.EventProgress
 	session    string
 }
 
@@ -42,8 +45,19 @@ func New(name, version string) *Extension {
 		caps:       map[string]capability{},
 		state:      map[string]protocol.StateItem{},
 		knownState: map[string]bool{},
+		subs:       map[string]protocol.SubscriptionScope{},
+		knownSubs:  map[string]bool{},
+		events:     map[string]protocol.EventProgress{},
 	}
 }
+
+// Event statuses reported to the host. They are strings rather than
+// booleans so an in-flight event is never conflated with a confirmed one.
+const (
+	EventReceived   = "received"
+	EventProcessing = "processing"
+	EventConfirmed  = "confirmed"
+)
 
 // Handle registers a handler for a capability at the given version.
 func (e *Extension) Handle(name string, version int, h Handler) {
@@ -58,6 +72,59 @@ func (e *Extension) DeclareStateKeys(keys ...string) {
 	for _, k := range keys {
 		e.knownState[k] = true
 	}
+}
+
+// DeclareSubscriptionIDs records which durable subscriptions a build can
+// resume after an upgrade or rollback.
+func (e *Extension) DeclareSubscriptionIDs(ids ...string) {
+	for _, id := range ids {
+		e.knownSubs[id] = true
+	}
+}
+
+// SaveSubscription records a durable subscription scope.
+func (e *Extension) SaveSubscription(sub protocol.SubscriptionScope) error {
+	e.stateMu.Lock()
+	e.subs[sub.ID] = sub
+	session := e.session
+	e.stateMu.Unlock()
+	if session == "" {
+		return nil
+	}
+	return e.send(&protocol.Message{Type: protocol.TypeSubscriptionsData, Session: session, Subscriptions: []protocol.SubscriptionScope{sub}})
+}
+
+// ReportEvent records and reports the current lifecycle status of an
+// identified event. Only confirmed events represent externally visible
+// completion.
+func (e *Extension) ReportEvent(ev protocol.EventProgress) error {
+	e.stateMu.Lock()
+	if e.session != "" {
+		ev.OwnerVersion = e.Version
+		ev.OwnerSession = e.session
+	}
+	e.events[eventKey(ev)] = ev
+	session := e.session
+	report := ev
+	e.stateMu.Unlock()
+	if session == "" {
+		return nil
+	}
+	return e.send(&protocol.Message{Type: protocol.TypeEventProgress, Session: session, Events: []protocol.EventProgress{report}})
+}
+
+// IsConfirmedEvent reports whether this process already has a confirmed
+// marker for an event. Handlers can use it to make duplicate delivery
+// idempotent.
+func (e *Extension) IsConfirmedEvent(subID, eventID string) bool {
+	e.stateMu.Lock()
+	defer e.stateMu.Unlock()
+	ev, ok := e.events[eventKey(protocol.EventProgress{SubscriptionID: subID, EventID: eventID})]
+	return ok && ev.Status == EventConfirmed
+}
+
+func eventKey(ev protocol.EventProgress) string {
+	return ev.SubscriptionID + "\x00" + ev.EventID
 }
 
 // SetState records one state item and notifies the host. Each update
@@ -164,6 +231,47 @@ func (e *Extension) Run() error {
 				ID:      msg.ID,
 				Items:   items,
 			})
+		case protocol.TypeSubscriptionsQuery:
+			e.stateMu.Lock()
+			subs := make([]protocol.SubscriptionScope, 0, len(e.subs))
+			for _, sub := range e.subs {
+				subs = append(subs, sub)
+			}
+			events := make([]protocol.EventProgress, 0, len(e.events))
+			for _, ev := range e.events {
+				events = append(events, ev)
+			}
+			e.stateMu.Unlock()
+			_ = e.send(&protocol.Message{Type: protocol.TypeSubscriptionsData, Session: session, ID: msg.ID, Subscriptions: subs, Events: events})
+		case protocol.TypeSubscriptionsCheck:
+			resp := &protocol.Message{Type: protocol.TypeSubscriptionsCheckResult, Session: session, ID: msg.ID}
+			for _, sub := range msg.Subscriptions {
+				if e.knownSubs[sub.ID] {
+					resp.Accepted = append(resp.Accepted, sub.ID)
+				} else {
+					resp.Rejected = append(resp.Rejected, sub.ID)
+				}
+			}
+			_ = e.send(resp)
+		case protocol.TypeSubscriptionsLoad:
+			e.stateMu.Lock()
+			for _, sub := range msg.Subscriptions {
+				e.subs[sub.ID] = sub
+			}
+			e.stateMu.Unlock()
+			_ = e.send(&protocol.Message{Type: protocol.TypeSubscriptionsLoaded, Session: session, ID: msg.ID})
+		case protocol.TypeEventsLoad:
+			e.stateMu.Lock()
+			for _, ev := range msg.Events {
+				k := eventKey(ev)
+				cur, exists := e.events[k]
+				if !exists || eventStatusRank(ev.Status) > eventStatusRank(cur.Status) ||
+					(eventStatusRank(ev.Status) == eventStatusRank(cur.Status) && ev.Position > cur.Position) {
+					e.events[k] = ev
+				}
+			}
+			e.stateMu.Unlock()
+			_ = e.send(&protocol.Message{Type: protocol.TypeEventsLoaded, Session: session, ID: msg.ID})
 		case protocol.TypeStateCheck:
 			resp := &protocol.Message{
 				Type:    protocol.TypeStateCheckResult,
@@ -195,6 +303,19 @@ func (e *Extension) Run() error {
 				ID:      msg.ID,
 			})
 		}
+	}
+}
+
+func eventStatusRank(status string) int {
+	switch status {
+	case EventReceived:
+		return 1
+	case EventProcessing:
+		return 2
+	case EventConfirmed:
+		return 3
+	default:
+		return 0
 	}
 }
 
