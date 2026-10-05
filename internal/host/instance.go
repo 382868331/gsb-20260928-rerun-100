@@ -510,6 +510,39 @@ func (inst *Instance) call(id, capability string, payload json.RawMessage, timeo
 	}, timeout)
 }
 
+// callAsync sends one task without imposing a host-side timeout and
+// returns a channel that yields exactly one reply: the extension's
+// response, or an error message (ErrCrashed) if the process dies first.
+// The keyed executor uses this so a slow event is failed by the
+// executor's own policy (timeout / manual resolution) while a reply
+// that arrives afterwards is still captured as late evidence instead
+// of being dropped on the floor.
+func (inst *Instance) callAsync(id, capability string, payload json.RawMessage) (<-chan *protocol.Message, error) {
+	inst.mu.Lock()
+	if !inst.alive {
+		inst.mu.Unlock()
+		return nil, ErrCrashed
+	}
+	pc := &pendingCall{ch: make(chan *protocol.Message, 1)}
+	inst.pending[id] = pc
+	inst.mu.Unlock()
+
+	msg := &protocol.Message{
+		Type:    protocol.TypeTask,
+		ID:      id,
+		Cap:     capability,
+		Payload: payload,
+		Session: inst.session,
+	}
+	if err := protocol.Encode(inst.stdin, msg); err != nil {
+		inst.mu.Lock()
+		delete(inst.pending, id)
+		inst.mu.Unlock()
+		return nil, fmt.Errorf("send task: %w", err)
+	}
+	return pc.ch, nil
+}
+
 // isAlive reports whether the process is still running.
 func (inst *Instance) isAlive() bool {
 	inst.mu.Lock()

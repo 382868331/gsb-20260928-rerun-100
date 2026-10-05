@@ -51,6 +51,37 @@ type SwitchRecord struct {
 	Detail     string    `json:"detail,omitempty"`
 }
 
+// Keyed-event evidence kinds recorded by KeyedExecutor.
+const (
+	KeyedReceived     = "received"
+	KeyedBackpressure = "backpressure"
+	KeyedDispatched   = "dispatched"
+	KeyedConfirmed    = "confirmed"
+	KeyedFailed       = "failed"
+	KeyedUnknown      = "unknown_effect"
+	KeyedLateReply    = "late_reply"
+	KeyedResolved     = "resolved"
+	KeyedRescale      = "rescale"
+	KeyedWorkerExit   = "worker_exit"
+)
+
+// KeyedRecord is one entry in the keyed-subscription evidence trail.
+// A late reply is recorded with the generation and session that
+// produced it so it can be audited as evidence for the original event
+// without ever confirming a newer dispatch.
+type KeyedRecord struct {
+	Time         time.Time `json:"time"`
+	Subscription string    `json:"subscription"`
+	Kind         string    `json:"kind"`
+	EventID      string    `json:"event_id,omitempty"`
+	Key          string    `json:"key,omitempty"`
+	Seq          uint64    `json:"seq,omitempty"`
+	Worker       int       `json:"worker,omitempty"`
+	Session      string    `json:"session,omitempty"`
+	Gen          uint64    `json:"gen,omitempty"`
+	Detail       string    `json:"detail,omitempty"`
+}
+
 // Journal appends task records to a JSON-lines file.
 type Journal struct {
 	mu       sync.Mutex
@@ -58,6 +89,7 @@ type Journal struct {
 	enc      *json.Encoder
 	records  []JournalEntry
 	switches []SwitchRecord
+	keyed    []KeyedRecord
 }
 
 func OpenJournal(path string) (*Journal, error) {
@@ -104,6 +136,27 @@ func (j *Journal) SwitchRecords() []SwitchRecord {
 	defer j.mu.Unlock()
 	out := make([]SwitchRecord, len(j.switches))
 	copy(out, j.switches)
+	return out
+}
+
+// Keyed appends one keyed-subscription evidence record.
+func (j *Journal) Keyed(r KeyedRecord) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	r.Time = time.Now().UTC()
+	j.keyed = append(j.keyed, r)
+	if j.enc != nil {
+		b, _ := json.Marshal(&r)
+		_, _ = j.f.Write(append(b, '\n'))
+	}
+}
+
+// KeyedRecords returns a copy of every keyed-subscription record.
+func (j *Journal) KeyedRecords() []KeyedRecord {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]KeyedRecord, len(j.keyed))
+	copy(out, j.keyed)
 	return out
 }
 
