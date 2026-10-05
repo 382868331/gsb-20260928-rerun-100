@@ -37,6 +37,10 @@ type Config struct {
 	TaskTimeout      time.Duration
 	ShutdownGrace    time.Duration
 	Journal          *Journal
+	// Recovery, when set, durably records subscription scopes, event
+	// progress, session ownership and switch decisions so a full host
+	// restart with the same state directory resumes them.
+	Recovery *RecoveryLog
 }
 
 // Manager owns the lifecycle of all extension processes.
@@ -77,6 +81,14 @@ func New(manifests []Manifest, cfg Config) (*Manager, error) {
 		return nil, err
 	}
 	m.order = order
+	if cfg.Recovery != nil {
+		// A previous run with the same state directory may have
+		// recorded who was responsible for each session; that history
+		// must survive a full host restart.
+		for session, owner := range cfg.Recovery.Owners() {
+			m.owners[session] = owner
+		}
+	}
 	return m, nil
 }
 
@@ -183,6 +195,12 @@ func (m *Manager) Start() error {
 			m.rollback(started)
 			return err
 		}
+		inst.recovery = m.cfg.Recovery
+		if err := m.restoreRecovered(name, inst); err != nil {
+			inst.shutdown(0)
+			m.rollback(started)
+			return fmt.Errorf("restore %s recovered subscriptions: %w", name, err)
+		}
 		m.instances[name] = inst
 		for _, c := range mf.Provides {
 			m.providers[c] = name
@@ -230,6 +248,36 @@ func (m *Manager) rollback(names []string) {
 			delete(m.instances, names[i])
 		}
 	}
+}
+
+// restoreRecovered reloads the durable subscription scopes and the
+// event ledger recorded in the recovery log into a freshly started
+// incarnation. Confirmed events come back as dedupe markers (they are
+// never re-confirmed), pending events come back with their last known
+// status so processing continues instead of restarting from empty.
+func (m *Manager) restoreRecovered(name string, inst *Instance) error {
+	rec := m.cfg.Recovery
+	if rec == nil {
+		return nil
+	}
+	subs := rec.Subscriptions(name)
+	events := rec.Events(name)
+	if len(subs) == 0 && len(events) == 0 {
+		return nil
+	}
+	if len(subs) > 0 {
+		if err := inst.loadSubscriptions(m.nextReqID(), subs, m.cfg.TaskTimeout); err != nil {
+			return err
+		}
+	}
+	if len(events) > 0 {
+		if err := inst.loadEvents(m.nextReqID(), events, m.cfg.TaskTimeout); err != nil {
+			return err
+		}
+	}
+	inst.noteSubscriptions(subs)
+	inst.noteEvents(events)
+	return nil
 }
 
 // Call dispatches one task to the extension providing the capability.
@@ -318,6 +366,11 @@ func (m *Manager) Restart(name string) error {
 	inst, err := spawn(mf, m.cfg.HandshakeTimeout)
 	if err != nil {
 		return err
+	}
+	inst.recovery = m.cfg.Recovery
+	if err := m.restoreRecovered(name, inst); err != nil {
+		inst.shutdown(0)
+		return fmt.Errorf("restore %s recovered subscriptions: %w", name, err)
 	}
 	m.instances[name] = inst
 	for _, c := range mf.Provides {
@@ -503,6 +556,7 @@ func (m *Manager) finishUpgrade(su *stagedUpgrade) {
 		}
 		m.instances[item.name] = item.new
 		m.manifests[item.name] = next[item.name]
+		item.new.recovery = m.cfg.Recovery
 		m.setOwnerLocked(item.new.session, item.name, item.new.extVer, true, "activated by "+upgradeID)
 		m.recordSwitchLocked(SwitchCutover, upgradeID, item.name, item.old, item.new, "new tasks route to new version")
 	}

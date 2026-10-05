@@ -41,6 +41,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer journal.Close()
+	recovery, err := host.OpenRecoveryLog(filepath.Join("state", "recovery.jsonl"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer recovery.Close()
 
 	manifests := []host.Manifest{
 		{
@@ -63,6 +68,7 @@ func main() {
 		TaskTimeout:      1500 * time.Millisecond,
 		ShutdownGrace:    2 * time.Second,
 		Journal:          journal,
+		Recovery:         recovery,
 	})
 	if err != nil {
 		log.Fatalf("manifest check failed before anything started: %v", err)
@@ -71,6 +77,22 @@ func main() {
 		log.Fatalf("startup failed, rolled back: %v", err)
 	}
 	fmt.Println("[host] extensions started in dependency order: hashkit, textkit")
+
+	// --- Recovered durable state ----------------------------------
+	// A previous run with the same state directory leaves its
+	// subscription scopes, event ledger and session ownership behind;
+	// they are replayed into the fresh incarnations, not reset.
+	for _, name := range []string{"hashkit", "textkit"} {
+		subs := recovery.Subscriptions(name)
+		events := recovery.Events(name)
+		if len(subs) > 0 || len(events) > 0 {
+			fmt.Printf("[recover] %s resumed %d subscription(s), %d event(s) from state/recovery.jsonl\n",
+				name, len(subs), len(events))
+		}
+	}
+	if owners := recovery.Owners(); len(owners) > 0 {
+		fmt.Printf("[recover] %d historical session ownership record(s) restored\n", len(owners))
+	}
 
 	// --- Normal task dispatch -------------------------------------
 	fmt.Println("[task] uppercase ->", mustJSON(mgr.Call("uppercase", map[string]string{"text": "hello extensions"})))

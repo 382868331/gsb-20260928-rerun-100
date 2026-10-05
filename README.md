@@ -76,6 +76,25 @@ drained / activated / abort / rollback）通过 Journal.SwitchRecords
   不切回、不重放，新版本继续负责并返回包含订阅不确定范围的 RollbackReport。
 - cmd/host — 主程序演示；cmd/textkit、cmd/hashkit 为两个自带扩展。
 
+## 宿主重启后的恢复
+
+宿主把订阅与事件进度持久保存到恢复日志（默认 state/recovery.jsonl，
+JSONL 追加写）：订阅范围、逐条事件进度（received / processing /
+confirmed 及其责任版本与会话）、每个会话令牌的最后责任版本、每次
+切换的用户决定（migrate / discard / stop_subscription）以及切换时的
+确认水位。宿主整体关闭后用同一状态目录重新启动时：
+
+- 新拉起的扩展进程会被重新注入保存的订阅范围和事件账本，历史可直接
+  查看（DumpSubscriptions），不会重置为空；
+- 已确认事件作为去重标记恢复，重复送达不会再次确认、不会重复产生
+  外部效果；未确认事件以保持原状态恢复，可继续处理直至确认；
+- SessionOwner 仍能查到每一代会话的最后责任版本（含已随关闭退役的
+  会话）。
+
+恢复日志容忍崩溃留下的不完整尾部：重开时丢弃最后一条不完整的记录
+并把文件截断回最近一条完整记录，之前的记录全部保留。恢复行为由
+正常关闭重开、日志尾部截断、连续升级后重启三组测试覆盖。
+
 textkit 额外提供 sleep（慢任务，用于超时验证）和 panic（异常退出，
 用于崩溃隔离验证），它们是内置自检能力，不执行任何外部输入代码。
 

@@ -39,6 +39,9 @@ func (m *Manager) setOwnerLocked(session, ext, ver string, active bool, note str
 		return
 	}
 	m.owners[session] = SessionOwnership{Extension: ext, Version: ver, Active: active, Note: note}
+	if m.cfg.Recovery != nil {
+		m.cfg.Recovery.logOwner(session, m.owners[session])
+	}
 }
 
 // Disposition is the user's decision for one session whose saved state
@@ -207,6 +210,9 @@ func (m *Manager) ConfirmUpgrade(planID string, decisions map[string]Disposition
 		d := decisions[s.Extension]
 		if d == DecideCancel {
 			m.recordSwitch(SwitchConfirmed, plan.ID, s.Extension, nil, nil, "user cancelled the upgrade")
+			if m.cfg.Recovery != nil {
+				m.cfg.Recovery.logDecision(plan.ID, decisions, "upgrade cancelled by user")
+			}
 			m.abortUpgrade(plan.su.id, plan.su.staged, plan.su.prepared,
 				fmt.Errorf("cancelled by user"), plan.su.stop)
 			m.takePlan(planID)
@@ -262,6 +268,9 @@ func (m *Manager) ConfirmUpgrade(planID string, decisions map[string]Disposition
 		m.recordSwitch(SwitchConfirmed, plan.ID, item.name, item.old, item.new,
 			fmt.Sprintf("user decision %q; %d state items handed to the new version", decision, migrated))
 	}
+	if m.cfg.Recovery != nil {
+		m.cfg.Recovery.logDecision(plan.ID, decisions, "upgrade confirmed and activated")
+	}
 	m.finishUpgrade(plan.su)
 	return nil
 }
@@ -279,6 +288,9 @@ func (m *Manager) CancelUpgrade(planID string, reason string) error {
 		reason = "cancelled by user"
 	}
 	m.recordSwitch(SwitchConfirmed, plan.ID, "", nil, nil, "user declined the upgrade: "+reason)
+	if m.cfg.Recovery != nil {
+		m.cfg.Recovery.logDecision(plan.ID, nil, "upgrade declined: "+reason)
+	}
 	m.abortUpgrade(plan.su.id, plan.su.staged, plan.su.prepared, fmt.Errorf("%s", reason), plan.su.stop)
 	return nil
 }

@@ -47,6 +47,7 @@ type Instance struct {
 	eventSink     func([]protocol.EventProgress)
 	subscriptions map[string]protocol.SubscriptionScope
 	events        map[string]protocol.EventProgress
+	recovery      *RecoveryLog // durable host-side mirror, nil in memory-only setups
 }
 
 // EndReason explains why a wait on an instance finished.
@@ -220,6 +221,9 @@ func (inst *Instance) noteSubscriptions(subs []protocol.SubscriptionScope) {
 	defer inst.stateMu.Unlock()
 	for _, sub := range subs {
 		inst.subscriptions[sub.ID] = sub
+		if inst.recovery != nil {
+			inst.recovery.logSubscription(inst.name, sub)
+		}
 	}
 }
 
@@ -240,6 +244,9 @@ func (inst *Instance) noteEvents(events []protocol.EventProgress) []protocol.Eve
 			(eventRank(ev.Status) == eventRank(cur.Status) && ev.Position > cur.Position) {
 			inst.events[key] = ev
 			fresh = append(fresh, ev)
+			if inst.recovery != nil {
+				inst.recovery.logEvent(inst.name, ev)
+			}
 		}
 	}
 	return fresh
@@ -329,6 +336,9 @@ func (inst *Instance) querySubscriptions(id string, timeout time.Duration) ([]pr
 	defer inst.stateMu.Unlock()
 	for _, sub := range resp.Subscriptions {
 		inst.subscriptions[sub.ID] = sub
+		if inst.recovery != nil {
+			inst.recovery.logSubscription(inst.name, sub)
+		}
 	}
 	for _, ev := range resp.Events {
 		k := eventKey(ev)
@@ -336,6 +346,9 @@ func (inst *Instance) querySubscriptions(id string, timeout time.Duration) ([]pr
 		if !exists || eventRank(ev.Status) > eventRank(cur.Status) ||
 			(eventRank(ev.Status) == eventRank(cur.Status) && ev.Position > cur.Position) {
 			inst.events[k] = ev
+			if inst.recovery != nil {
+				inst.recovery.logEvent(inst.name, ev)
+			}
 		}
 	}
 	subs := make([]protocol.SubscriptionScope, 0, len(inst.subscriptions))
@@ -404,6 +417,9 @@ func (inst *Instance) adoptConfirmedEvent(ev protocol.EventProgress) bool {
 	}
 	ev.Status = "confirmed"
 	inst.events[eventKey(ev)] = ev
+	if inst.recovery != nil {
+		inst.recovery.logEvent(inst.name, ev)
+	}
 	return true
 }
 

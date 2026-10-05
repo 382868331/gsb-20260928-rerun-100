@@ -81,6 +81,7 @@ func (m *Manager) transferSubscriptions(item *stagedItem, previews []Subscriptio
 	}
 	var live []protocol.SubscriptionScope
 	confirmed := map[string]protocol.EventProgress{}
+	watermark := map[string]uint64{}
 	for _, p := range fresh {
 		if stopped[p.Scope.ID] || subscriptionDecision(decisions, item.name, p.Scope.ID) == DecideStopSubscription {
 			continue
@@ -89,7 +90,18 @@ func (m *Manager) transferSubscriptions(item *stagedItem, previews []Subscriptio
 		for _, ev := range p.Events {
 			if ev.Status == "confirmed" {
 				confirmed[eventKey(ev)] = ev
+				if ev.Position > watermark[ev.SubscriptionID] {
+					watermark[ev.SubscriptionID] = ev.Position
+				}
 			}
+		}
+	}
+	if m.cfg.Recovery != nil {
+		// Persist the confirmation watermarks at the switch boundary:
+		// after a host restart the new run can prove how far each
+		// subscription had been confirmed before the handoff.
+		for _, sub := range live {
+			m.cfg.Recovery.logWatermark(item.name, sub.ID, watermark[sub.ID])
 		}
 	}
 	if err := next.loadSubscriptions(m.nextReqID(), live, m.cfg.TaskTimeout); err != nil {
