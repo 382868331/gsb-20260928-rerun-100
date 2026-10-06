@@ -24,6 +24,10 @@ const (
 	RecOwner        = "owner"
 	RecDecision     = "decision"
 	RecWatermark    = "watermark"
+	RecKeyedSub      = "keyed_sub"      // a business-key ordered event bus exists
+	RecKeyedEvent    = "keyed_event"    // one event's progress inside a keyed bus
+	RecKeyedEvidence = "keyed_evidence" // late reply kept as evidence, never applied
+	RecKeyedCancel   = "keyed_cancel"   // the bus subscription was cancelled
 )
 
 // SwitchDecision is the durable record of how a prepared upgrade was
@@ -54,6 +58,42 @@ type RecoveryRecord struct {
 	// at the moment a switch was confirmed.
 	SubscriptionID    string `json:"subscription_id,omitempty"`
 	ConfirmedPosition uint64 `json:"confirmed_position,omitempty"`
+
+	// Keyed event bus records. Raw carries the JSON-encoded worker
+	// Manifest so a host restart can relaunch the same handler binary.
+	BusID         string            `json:"bus_id,omitempty"`
+	Workers       int               `json:"workers,omitempty"`
+	QueueLimit    int               `json:"queue_limit,omitempty"`
+	Capability    string            `json:"capability,omitempty"`
+	Raw           json.RawMessage   `json:"raw,omitempty"`
+	KeyedEvent    *KeyedEventRec    `json:"keyed_event,omitempty"`
+	KeyedEvidence *KeyedEvidenceRec `json:"keyed_evidence,omitempty"`
+}
+
+// KeyedEventRec is the durable shape of one event inside a keyed bus.
+type KeyedEventRec struct {
+	Key          string `json:"key"`
+	EventID      string `json:"event_id"`
+	Position     uint64 `json:"position"`
+	Status       string `json:"status"`
+	OwnerSession string `json:"owner_session,omitempty"`
+	OwnerVersion string `json:"owner_version,omitempty"`
+	Attempts     int    `json:"attempts,omitempty"`
+	Detail       string `json:"detail,omitempty"`
+}
+
+// KeyedEvidenceRec preserves a reply that arrived from a generation no
+// longer responsible for the key. It is evidence about the original
+// event only; it can never confirm a newer event for the same key.
+type KeyedEvidenceRec struct {
+	Key          string    `json:"key"`
+	EventID      string    `json:"event_id"`
+	Position     uint64    `json:"position"`
+	OwnerSession string    `json:"owner_session"`
+	OwnerVersion string    `json:"owner_version"`
+	Outcome      string    `json:"outcome"`
+	Detail       string    `json:"detail,omitempty"`
+	Time         time.Time `json:"time"`
 }
 
 // RecoveryLog appends durable host state to a JSON-lines file and
@@ -71,6 +111,24 @@ type RecoveryLog struct {
 	owners    map[string]SessionOwnership                      // session token
 	decisions []SwitchDecision
 	watermark map[string]uint64 // ext|sub id -> confirmed position
+
+	keyedSubs      map[string]keyedSubState
+	keyedEvents    map[string]map[string]KeyedEventRec // bus id -> key|eventID
+	keyedEvidence  map[string][]KeyedEvidenceRec
+}
+
+// KeyedSubRec is the durable description of a business-key event bus.
+type KeyedSubRec struct {
+	ID         string
+	Workers    int
+	QueueLimit int
+	Capability string
+	Manifest   Manifest
+}
+
+type keyedSubState struct {
+	rec      KeyedSubRec
+	cancelled bool
 }
 
 // OpenRecoveryLog opens (or creates) the recovery log at path, replays
@@ -86,6 +144,9 @@ func OpenRecoveryLog(path string) (*RecoveryLog, error) {
 		events:    map[string]map[string]protocol.EventProgress{},
 		owners:    map[string]SessionOwnership{},
 		watermark: map[string]uint64{},
+		keyedSubs:     map[string]keyedSubState{},
+		keyedEvents:   map[string]map[string]KeyedEventRec{},
+		keyedEvidence: map[string][]KeyedEvidenceRec{},
 	}
 	good, err := l.replay()
 	if err != nil {
@@ -176,6 +237,41 @@ func (l *RecoveryLog) apply(rec RecoveryRecord) {
 		if rec.ConfirmedPosition > l.watermark[key] {
 			l.watermark[key] = rec.ConfirmedPosition
 		}
+	case RecKeyedSub:
+		if rec.BusID == "" || len(rec.Raw) == 0 {
+			return
+		}
+		var mf Manifest
+		if err := json.Unmarshal(rec.Raw, &mf); err != nil {
+			return
+		}
+		l.keyedSubs[rec.BusID] = keyedSubState{rec: KeyedSubRec{
+			ID: rec.BusID, Workers: rec.Workers, QueueLimit: rec.QueueLimit,
+			Capability: rec.Capability, Manifest: mf,
+		}}
+	case RecKeyedCancel:
+		if st, ok := l.keyedSubs[rec.BusID]; ok {
+			st.cancelled = true
+			l.keyedSubs[rec.BusID] = st
+		} else {
+			l.keyedSubs[rec.BusID] = keyedSubState{cancelled: true}
+		}
+	case RecKeyedEvent:
+		if rec.KeyedEvent == nil {
+			return
+		}
+		m := l.keyedEvents[rec.BusID]
+		if m == nil {
+			m = map[string]KeyedEventRec{}
+			l.keyedEvents[rec.BusID] = m
+		}
+		ev := *rec.KeyedEvent
+		key := ev.Key + "\x00" + ev.EventID
+		m[key] = ev // append-only log: later records are the newer state
+	case RecKeyedEvidence:
+		if rec.KeyedEvidence != nil {
+			l.keyedEvidence[rec.BusID] = append(l.keyedEvidence[rec.BusID], *rec.KeyedEvidence)
+		}
 	}
 }
 
@@ -220,6 +316,83 @@ func (l *RecoveryLog) logWatermark(ext, subID string, position uint64) {
 		Kind: RecWatermark, Extension: ext,
 		SubscriptionID: subID, ConfirmedPosition: position,
 	})
+}
+
+func (l *RecoveryLog) logKeyedSub(rec KeyedSubRec) {
+	raw, _ := json.Marshal(rec.Manifest)
+	l.append(RecoveryRecord{
+		Kind: RecKeyedSub, BusID: rec.ID, Workers: rec.Workers,
+		QueueLimit: rec.QueueLimit, Capability: rec.Capability, Raw: raw,
+	})
+}
+
+func (l *RecoveryLog) logKeyedEvent(busID string, ev KeyedEventRec) {
+	cp := ev
+	l.append(RecoveryRecord{Kind: RecKeyedEvent, BusID: busID, KeyedEvent: &cp})
+}
+
+func (l *RecoveryLog) logKeyedEvidence(busID string, ev KeyedEvidenceRec) {
+	cp := ev
+	l.append(RecoveryRecord{Kind: RecKeyedEvidence, BusID: busID, KeyedEvidence: &cp})
+}
+
+func (l *RecoveryLog) logKeyedCancel(busID string) {
+	l.append(RecoveryRecord{Kind: RecKeyedCancel, BusID: busID})
+}
+
+// KeyedSubscriptions returns the recovered description of every keyed
+// event bus from previous runs, including buses that were cancelled.
+func (l *RecoveryLog) KeyedSubscriptions() map[string]KeyedSubRec {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := map[string]KeyedSubRec{}
+	for id, st := range l.keyedSubs {
+		rec := st.rec
+		rec.ID = id
+		out[id] = rec
+	}
+	return out
+}
+
+// KeyedCancelled reports which bus ids were explicitly unsubscribed.
+func (l *RecoveryLog) KeyedCancelled() map[string]bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := map[string]bool{}
+	for id, st := range l.keyedSubs {
+		if st.cancelled {
+			out[id] = true
+		}
+	}
+	return out
+}
+
+// KeyedEvents returns the recovered per-event ledger for one bus in
+// key then stream-position order.
+func (l *RecoveryLog) KeyedEvents(busID string) []KeyedEventRec {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	m := l.keyedEvents[busID]
+	out := make([]KeyedEventRec, 0, len(m))
+	for _, ev := range m {
+		out = append(out, ev)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Key != out[j].Key {
+			return out[i].Key < out[j].Key
+		}
+		return out[i].Position < out[j].Position
+	})
+	return out
+}
+
+// KeyedEvidence returns the preserved late-reply evidence for one bus.
+func (l *RecoveryLog) KeyedEvidence(busID string) []KeyedEvidenceRec {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]KeyedEvidenceRec, len(l.keyedEvidence[busID]))
+	copy(out, l.keyedEvidence[busID])
+	return out
 }
 
 // Subscriptions returns the durable scopes recorded for an extension.
